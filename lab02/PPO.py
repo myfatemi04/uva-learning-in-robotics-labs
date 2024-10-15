@@ -7,6 +7,9 @@ import matplotlib.pyplot as plt
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import math
+import tqdm
+import json
 
 class Policy(nn.Module):
     def __init__(self):
@@ -18,12 +21,12 @@ class Policy(nn.Module):
         self.logvar_head = nn.Linear(32, 9)
         
     def forward(self, states: torch.Tensor):
-        x = F.relu(self.lin1(states))
-        x = F.relu(self.lin2(x))
+        x = F.gelu(self.lin1(states))
+        x = F.gelu(self.lin2(x))
         # mean: (-1, 1)
         mean = F.tanh(self.mean_head(x))
         # logvar: (-infty, 0] so that variance is in range [0, 1]
-        logvar = -F.relu(self.logvar_head(x))
+        logvar = -F.gelu(self.logvar_head(x))
         return mean, logvar
 
 class ValueNetwork(nn.Module):
@@ -32,15 +35,13 @@ class ValueNetwork(nn.Module):
 
         self.lin1 = nn.Linear(51, 64)
         self.lin2 = nn.Linear(64, 32)
-        self.va_head = nn.Linear(32, 2)
+        self.va_head = nn.Linear(32, 1)
         
     def forward(self, states: torch.Tensor):
         x = F.relu(self.lin1(states))
         x = F.relu(self.lin2(x))
         va = self.va_head(x)
-        values = va[..., 0]
-        advantages = va[..., 1]
-        return values, advantages
+        return va[..., 0]
 
 # Note: This function works for (t, batch) tensors as well.
 def calculate_returns_simple(rewards: torch.Tensor, gamma):
@@ -58,11 +59,9 @@ def logprobs(means, logvars, actions):
 def compute_advantages_via_td_residual(V, states, actions, rewards, next_states, gamma):
     return (V(next_states) * gamma + rewards) - V(states)
 
-def ppo_loss(policy, policy_ref, V, states, actions, rewards, epsilon=0.2, vf_coef=0.5, entropy_coef=0.1, gamma=0.9):
+def ppo_loss(policy, policy_ref, V, states, actions, rewards, epsilon=0.2, vf_coef=0.5, entropy_coef=0.01, gamma=0.9):
     next_states = states[1:]
     states = states[:-1]
-
-    print(states.shape, actions.shape, rewards.shape)
 
     means_base, logvars_base = policy(states)
     logprobs_base = logprobs(means_base, logvars_base, actions)
@@ -71,16 +70,17 @@ def ppo_loss(policy, policy_ref, V, states, actions, rewards, epsilon=0.2, vf_co
         logprobs_ref = logprobs(*policy_ref(states), actions)
     logprob_ratio = logprobs_base - logprobs_ref
 
-    policy_loss = torch.min(advantages * log_ratio, advantages * torch.clamp(logprob_ratio, -epsilon, epsilon))
+    policy_loss = torch.min(advantages * logprob_ratio, advantages * torch.clamp(logprob_ratio, -epsilon, epsilon))
+    policy_loss = policy_loss.sum(dim=-1).mean()
 
     returns = calculate_returns_simple(rewards, gamma)
     vf_loss = F.mse_loss(V(states), returns)
 
     # E_p[log(Gaussian(µ, σ, x))] = 1/2*log(2πσ^2) + 1/2 = 1/2 * log(2π) + log(σ) + 1/2
     # We only really care about the log(σ) part though, which is equal to log(var) up to a constant factor of 2.
-    entropy_bonus = logvars_base.sum(dim=-1).mean()
+    entropy_bonus = logvars_base.sum(dim=-1).mean() + 1/2 * (1 + math.log(2 * np.pi))
 
-    return policy_loss + vf_coef * vf_loss + entropy_coef * entropy_bonus
+    return policy_loss + vf_coef * vf_loss + -entropy_coef * entropy_bonus, {"policy": policy_loss.item(), "vf": vf_loss.item(), "entropy": entropy_bonus.item()}
 
 # Observation space is 51 dims.
 # Action space is [-1, 1]^9.
@@ -93,7 +93,6 @@ def do_episode(model):
     rewards = []
 
     while not done:
-        print("Taking step.")
         mean, logvar = model(obs)
         action = torch.randn(mean.shape).to("cuda") * torch.exp(logvar / 2) + mean
 
@@ -108,9 +107,9 @@ def do_episode(model):
     # Add terminal state.
     states.append(obs)
 
-    states = torch.stack(states)
-    actions = torch.stack(actions)
-    rewards = torch.stack(rewards)
+    states = torch.stack(states).float()
+    actions = torch.stack(actions).float()
+    rewards = torch.stack(rewards).float()
 
     return (states, actions, rewards, truncated)
 
@@ -138,24 +137,34 @@ policy_ref.load_state_dict(policy_ref.state_dict())
 V = ValueNetwork().to("cuda")
 optimizer = torch.optim.Adam([*policy.parameters(), *V.parameters()])
 
-for epoch in range(100):
-    states, actions, rewards, truncated = do_episode(policy)
-    loss = ppo_loss(
-        policy,
-        policy_ref,
-        V,
-        states,
-        actions,
-        rewards,
-    )
-    optimizer.zero_grad()
-    loss.backward()
-    optimizer.step()
-    total_reward = sum(rewards)
-    print(loss, total_reward)
-    
-    if (epoch + 1) % 10 == 0:
-        policy_ref.load_state_dict(policy.state_dict())
+epochs = 10000
+ckpt_every = 200
+
+with tqdm.tqdm(total=epochs) as pbar:
+    for epoch in range(epochs):
+        states, actions, rewards, truncated = do_episode(policy)
+        loss, info = ppo_loss(
+            policy,
+            policy_ref,
+            V,
+            states,
+            actions,
+            rewards,
+        )
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+        total_reward = sum(rewards)
+        pbar.set_postfix({**info, "reward": total_reward.item()})
+        pbar.update()
+        if (epoch + 1) % 10 == 0:
+            policy_ref.load_state_dict(policy.state_dict())
+        
+        if (epoch + 1) % ckpt_every == 0:
+            torch.save(policy_ref.state_dict(), f"ckpt_{epoch + 1}.pt")
+
+        with open('reward.jsonl', 'a') as f:
+            f.write(json.dumps({"epoch": epoch, **info, "reward": total_reward.item()}) + "\n")
 
 """
 state = {
