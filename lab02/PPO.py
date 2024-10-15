@@ -8,7 +8,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-class Model(nn.Module):
+class Policy(nn.Module):
     def __init__(self):
         super().__init__()
 
@@ -26,7 +26,24 @@ class Model(nn.Module):
         logvar = -F.relu(self.logvar_head(x))
         return mean, logvar
 
-def calculate_returns_simple(rewards: torch.Tensor, gamma=0.9):
+class ValueNetwork(nn.Module):
+    def __init__(self):
+        super().__init__()
+
+        self.lin1 = nn.Linear(51, 64)
+        self.lin2 = nn.Linear(64, 32)
+        self.va_head = nn.Linear(32, 2)
+        
+    def forward(self, states: torch.Tensor):
+        x = F.relu(self.lin1(states))
+        x = F.relu(self.lin2(x))
+        va = self.va_head(x)
+        values = va[..., 0]
+        advantages = va[..., 1]
+        return values, advantages
+
+# Note: This function works for (t, batch) tensors as well.
+def calculate_returns_simple(rewards: torch.Tensor, gamma):
     returns = torch.zeros_like(rewards)
     returns[-1] = rewards[-1]
     for i in range(1, len(returns)):
@@ -38,16 +55,26 @@ def logprobs(means, logvars, actions):
     # We can omit the 2π because we ultimately care about probability ratio.
     return 0.5 * torch.pow(actions - means, 2)/torch.exp(logvars) - 0.5 * logvars
 
-def ppo_loss(policy, policy_ref, critic, states, actions, returns, epsilon=0.2, vf_coef=0.5, entropy_coef=0.1):
+def compute_advantages_via_td_residual(V, states, actions, rewards, next_states, gamma):
+    return (V(next_states) * gamma + rewards) - V(states)
+
+def ppo_loss(policy, policy_ref, V, states, actions, rewards, epsilon=0.2, vf_coef=0.5, entropy_coef=0.1, gamma=0.9):
+    next_states = states[1:]
+    states = states[:-1]
+
+    print(states.shape, actions.shape, rewards.shape)
+
     means_base, logvars_base = policy(states)
     logprobs_base = logprobs(means_base, logvars_base, actions)
     with torch.no_grad():
-        advantages = returns - torch.gather(critic(states), -1, actions)
+        advantages = compute_advantages_via_td_residual(V, states, actions, rewards, next_states, gamma)
         logprobs_ref = logprobs(*policy_ref(states), actions)
     logprob_ratio = logprobs_base - logprobs_ref
 
     policy_loss = torch.min(advantages * log_ratio, advantages * torch.clamp(logprob_ratio, -epsilon, epsilon))
-    vf_loss = F.mse_loss(critic(states, actions), returns)
+
+    returns = calculate_returns_simple(rewards, gamma)
+    vf_loss = F.mse_loss(V(states), returns)
 
     # E_p[log(Gaussian(µ, σ, x))] = 1/2*log(2πσ^2) + 1/2 = 1/2 * log(2π) + log(σ) + 1/2
     # We only really care about the log(σ) part though, which is equal to log(var) up to a constant factor of 2.
@@ -55,21 +82,6 @@ def ppo_loss(policy, policy_ref, critic, states, actions, returns, epsilon=0.2, 
 
     return policy_loss + vf_coef * vf_loss + entropy_coef * entropy_bonus
 
-env = gym.make(
-    "RotateValveLevel0-v1",
-    render_mode="rgb_array",
-    sim_backend="gpu",
-    control_mode="pd_joint_delta_pos",
-    obs_mode="state",
-)
-env = RecordEpisode(
-    env,
-    output_dir="Videos",
-    save_trajectory=False,
-    save_video=True,
-    video_fps=30,
-    max_steps_per_video=100,
-)
 # Observation space is 51 dims.
 # Action space is [-1, 1]^9.
 def do_episode(model):
@@ -93,19 +105,57 @@ def do_episode(model):
 
         done = terminated or truncated
 
+    # Add terminal state.
+    states.append(obs)
+
     states = torch.stack(states)
     actions = torch.stack(actions)
     rewards = torch.stack(rewards)
 
     return (states, actions, rewards, truncated)
 
+env = gym.make(
+    "RotateValveLevel0-v1",
+    render_mode="rgb_array",
+    sim_backend="gpu",
+    control_mode="pd_joint_delta_pos",
+    obs_mode="state",
+)
+env = RecordEpisode(
+    env,
+    output_dir="Videos",
+    save_trajectory=False,
+    save_video=True,
+    video_fps=30,
+    max_steps_per_video=100,
+)
+
 # obs, info = env.reset()
 # print(info)
-model = Model().to("cuda")
-ep = do_episode(model)
+policy = Policy().to("cuda")
+policy_ref = Policy().to("cuda")
+policy_ref.load_state_dict(policy_ref.state_dict())
+V = ValueNetwork().to("cuda")
+optimizer = torch.optim.Adam([*policy.parameters(), *V.parameters()])
 
-print(calculate_returns_simple(ep[2]))
-print(ep[2])
+for epoch in range(100):
+    states, actions, rewards, truncated = do_episode(policy)
+    loss = ppo_loss(
+        policy,
+        policy_ref,
+        V,
+        states,
+        actions,
+        rewards,
+    )
+    optimizer.zero_grad()
+    loss.backward()
+    optimizer.step()
+    total_reward = sum(rewards)
+    print(loss, total_reward)
+    
+    if (epoch + 1) % 10 == 0:
+        policy_ref.load_state_dict(policy.state_dict())
 
 """
 state = {
