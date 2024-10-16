@@ -11,18 +11,28 @@ import math
 import tqdm
 import json
 
+if torch.cuda.is_available():
+    device = "cuda"
+else:
+    device = "cpu"
+
+def make_base(sizes):
+    modules = []
+    for i in range(len(sizes) - 1):
+        modules.append(nn.Linear(sizes[i], sizes[i + 1]))
+        modules.append(nn.GELU())
+    return nn.Sequential(*modules)
+
 class Policy(nn.Module):
     def __init__(self):
         super().__init__()
 
-        self.lin1 = nn.Linear(51, 64)
-        self.lin2 = nn.Linear(64, 32)
-        self.mean_head = nn.Linear(32, 9)
-        self.logvar_head = nn.Linear(32, 9)
+        self.base = make_base([51, 64, 128, 128, 64])
+        self.mean_head = nn.Linear(64, 9)
+        self.logvar_head = nn.Linear(64, 9)
         
     def forward(self, states: torch.Tensor):
-        x = F.gelu(self.lin1(states))
-        x = F.gelu(self.lin2(x))
+        x = self.base(states)
         # mean: (-1, 1)
         mean = F.tanh(self.mean_head(x))
         # logvar: (-infty, 0] so that variance is in range [0, 1]
@@ -33,54 +43,75 @@ class ValueNetwork(nn.Module):
     def __init__(self):
         super().__init__()
 
-        self.lin1 = nn.Linear(51, 64)
-        self.lin2 = nn.Linear(64, 32)
-        self.va_head = nn.Linear(32, 1)
+        self.base = make_base([51, 64, 128, 128, 64])
+        self.value_head = nn.Linear(64, 1)
         
     def forward(self, states: torch.Tensor):
-        x = F.relu(self.lin1(states))
-        x = F.relu(self.lin2(x))
-        va = self.va_head(x)
-        return va[..., 0]
-
-# Note: This function works for (t, batch) tensors as well.
-def calculate_returns_simple(rewards: torch.Tensor, gamma):
-    returns = torch.zeros_like(rewards)
-    returns[-1] = rewards[-1]
-    for i in range(1, len(returns)):
-        returns[-i - 1] = rewards[-i - 1] + gamma * returns[-i]
-    return returns
+        x = self.base(states)
+        value = self.value_head(x)
+        return value[..., 0]
 
 def logprobs(means, logvars, actions):
     # log(Gaussian(µ, σ, x)) = -1/2 * ((x - µ)/σ)^2 - log(sqrt(2π)σ)
     # We can omit the 2π because we ultimately care about probability ratio.
-    return 0.5 * torch.pow(actions - means, 2)/torch.exp(logvars) - 0.5 * logvars
+    return (0.5 * torch.pow(actions - means, 2)/torch.exp(logvars) - 0.5 * logvars).sum(axis=-1)
 
 def compute_advantages_via_td_residual(V, states, actions, rewards, next_states, gamma):
     return (V(next_states) * gamma + rewards) - V(states)
 
-def ppo_loss(policy, policy_ref, V, states, actions, rewards, epsilon=0.2, vf_coef=0.5, entropy_coef=0.01, gamma=0.9):
+def reward_estimation(V, states, rewards, gamma, lambda_):
+    seqlen = states.shape[0]
+    td_lambda_estimate = torch.zeros(seqlen, device=device)
+    gae_estimate = torch.zeros(seqlen, device=device)
+    
+    # Compute values for each state
+    values = V(states)  # Assuming V is the value function network
+    
+    # Initialize eligibility trace
+    eligibility_trace = 0
+    
+    for t in reversed(range(seqlen)):
+        delta = rewards[t] + (gamma * values[t + 1] if t + 1 < seqlen else 0) - values[t]
+        
+        # Update eligibility trace with lambda_
+        eligibility_trace = gamma * lambda_ * eligibility_trace + 1
+        
+        # Update the TD(λ) estimate
+        td_lambda_estimate[t] = delta * eligibility_trace + values[t]
+        gae_estimate[t] = delta * eligibility_trace
+    
+    return td_lambda_estimate, gae_estimate
+
+def ppo_loss(policy, policy_ref, V, states, actions, rewards, epsilon=0.2, vf_coef=0.5, entropy_coef=0.01, gamma=0.9, lambda_=0.8):
+    states.squeeze_(-1)
+    actions.squeeze_(-1)
     next_states = states[1:]
     states = states[:-1]
 
     means_base, logvars_base = policy(states)
     logprobs_base = logprobs(means_base, logvars_base, actions)
     with torch.no_grad():
-        advantages = compute_advantages_via_td_residual(V, states, actions, rewards, next_states, gamma)
+        value_estimate, advantage_estimate = reward_estimation(V, states, rewards, gamma, lambda_)
         logprobs_ref = logprobs(*policy_ref(states), actions)
     logprob_ratio = logprobs_base - logprobs_ref
 
-    policy_loss = torch.min(advantages * logprob_ratio, advantages * torch.clamp(logprob_ratio, -epsilon, epsilon))
+    policy_loss = torch.min(advantage_estimate * logprob_ratio, advantage_estimate * torch.clamp(logprob_ratio, -epsilon, epsilon))
     policy_loss = policy_loss.sum(dim=-1).mean()
 
-    returns = calculate_returns_simple(rewards, gamma)
-    vf_loss = F.mse_loss(V(states), returns)
+    vf_loss = F.mse_loss(V(states), value_estimate)
 
     # E_p[log(Gaussian(µ, σ, x))] = 1/2*log(2πσ^2) + 1/2 = 1/2 * log(2π) + log(σ) + 1/2
     # We only really care about the log(σ) part though, which is equal to log(var) up to a constant factor of 2.
     entropy_bonus = logvars_base.sum(dim=-1).mean() + 1/2 * (1 + math.log(2 * np.pi))
 
-    return policy_loss + vf_coef * vf_loss + -entropy_coef * entropy_bonus, {"policy": policy_loss.item(), "vf": vf_loss.item(), "entropy": entropy_bonus.item()}
+    loss = policy_loss + vf_coef * vf_loss + -entropy_coef * entropy_bonus
+    info = {
+        "policy": policy_loss.item(),
+        "vf": vf_loss.item(),
+        "entropy": entropy_bonus.item(),
+    }
+    
+    return (loss, info)
 
 # Observation space is 51 dims.
 # Action space is [-1, 1]^9.
@@ -94,7 +125,7 @@ def do_episode(model):
 
     while not done:
         mean, logvar = model(obs)
-        action = torch.randn(mean.shape).to("cuda") * torch.exp(logvar / 2) + mean
+        action = torch.randn(mean.shape).to(device) * torch.exp(logvar / 2) + mean
 
         states.append(obs)
         actions.append(action)
@@ -131,18 +162,29 @@ env = RecordEpisode(
 
 # obs, info = env.reset()
 # print(info)
-policy = Policy().to("cuda")
-policy_ref = Policy().to("cuda")
+policy = Policy().to(device)
+policy_ref = Policy().to(device)
 policy_ref.load_state_dict(policy_ref.state_dict())
-V = ValueNetwork().to("cuda")
+V = ValueNetwork().to(device)
 optimizer = torch.optim.Adam([*policy.parameters(), *V.parameters()])
 
 epochs = 10000
 ckpt_every = 200
+buffer_episodes = 20
+# buffer_epochs = 10
 
 with tqdm.tqdm(total=epochs) as pbar:
     for epoch in range(epochs):
+        # buf_states = []
+        # buf_nextstates = []
+        # buf_actions = []
+        # buf_rewards = []
+        # for ep in range(buffer_episodes):
         states, actions, rewards, truncated = do_episode(policy)
+            # buf_states.append(states[:-1])
+            # buf_nextstates.append(states[1:])
+            # buf_actions.append(actions)
+            # buf_rewards.append(rewards)
         loss, info = ppo_loss(
             policy,
             policy_ref,
