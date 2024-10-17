@@ -11,6 +11,7 @@ import torch.nn.functional as F
 import math
 import tqdm
 import json
+import sys
 
 if torch.cuda.is_available():
     device = "cuda"
@@ -19,12 +20,14 @@ else:
 
 NUM_ENVS = 128
 
+
 def make_base(sizes):
     modules = []
     for i in range(len(sizes) - 1):
         modules.append(nn.Linear(sizes[i], sizes[i + 1]))
         modules.append(nn.GELU())
     return nn.Sequential(*modules)
+
 
 class Policy(nn.Module):
     def __init__(self, state_dim=48, act_dim=8):
@@ -33,7 +36,7 @@ class Policy(nn.Module):
         self.base = make_base([state_dim, 256, 256, 256, 64])
         self.mean_head = nn.Linear(64, act_dim)
         self.logvar_head = nn.Linear(64, act_dim)
-        
+
     def forward(self, states: torch.Tensor):
         x = self.base(states)
         # mean: (-1, 1)
@@ -42,56 +45,89 @@ class Policy(nn.Module):
         logvar = -F.gelu(self.logvar_head(x))
         return mean, logvar
 
+
 class ValueNetwork(nn.Module):
     def __init__(self, state_dim=48):
         super().__init__()
 
         self.base = make_base([state_dim, 256, 256, 256, 64])
         self.value_head = nn.Linear(64, 1)
-        
+
     def forward(self, states: torch.Tensor):
         x = self.base(states)
         value = self.value_head(x)
         return value[..., 0]
 
+
 def logprobs(means, logvars, actions):
     # log(Gaussian(µ, σ, x)) = -1/2 * ((x - µ)/σ)^2 - log(sqrt(2π)σ)
     # We can omit the 2π because we ultimately care about probability ratio.
-    return (-0.5 * torch.pow(actions - means, 2)/torch.exp(logvars) - 0.5 * logvars).sum(axis=-1)
+    return (
+        -0.5 * torch.pow(actions - means, 2) / torch.exp(logvars) - 0.5 * logvars
+    ).sum(axis=-1)
+
 
 def reward_estimation(V, states, rewards, gamma, lambda_):
     gae_estimate = torch.zeros(states.shape[:-1], device=device)
     values = V(states)
     gae = 0
-    
+
     seqlen = states.shape[-2]
     for t in reversed(range(seqlen)):
-        delta = rewards[..., t] + (gamma * values[..., t + 1] if t + 1 < seqlen else 0) - values[..., t]
+        delta = (
+            rewards[..., t]
+            + (gamma * values[..., t + 1] if t + 1 < seqlen else 0)
+            - values[..., t]
+        )
         gae = gamma * lambda_ * gae + delta
         gae_estimate[..., t] = gae
-    
+
     # returns and advantages
     return gae_estimate + values, gae_estimate
 
-def ppo_loss(policy, policy_ref, V, V_targ, states, actions, rewards, epsilon=0.1, vf_coef=1.0, entropy_coef=0.1, gamma=0.98, lambda_=0.96):
+
+def ppo_loss(
+    policy,
+    policy_ref,
+    V,
+    V_targ,
+    states,
+    actions,
+    rewards,
+    epsilon=0.1,
+    vf_coef=1.0,
+    entropy_coef=0.1,
+    gamma=0.98,
+    lambda_=0.96,
+    normalize_advantages=True,
+):
     states = states[:-1]
 
     means_base, logvars_base_ = policy(states)
     logvars_base = torch.max(torch.tensor(-4.0, device=device), logvars_base_)
     logprobs_base = logprobs(means_base, logvars_base, actions)
     with torch.no_grad():
-        value_estimate, advantage_estimate = reward_estimation(V_targ, states, rewards, gamma, lambda_)
+        value_estimate, advantage_estimate = reward_estimation(
+            V_targ, states, rewards, gamma, lambda_
+        )
         logprobs_ref = logprobs(*policy_ref(states), actions)
     logprob_ratio = logprobs_base - logprobs_ref
+    prob_ratio = torch.exp(logprob_ratio)
 
-    policy_loss = -torch.min(advantage_estimate * logprob_ratio, advantage_estimate * torch.clamp(logprob_ratio, -epsilon, epsilon))
+    if normalize_advantages:
+        advantage_estimate = (advantage_estimate - advantage_estimate.mean()) / (1e-8 + advantage_estimate.std())
+
+    policy_loss = -torch.min(
+        advantage_estimate * prob_ratio,
+        advantage_estimate * torch.clamp(prob_ratio, -epsilon, epsilon),
+    )
     policy_loss = policy_loss.sum(dim=-1).mean()
 
     vf_loss = F.mse_loss(V(states).squeeze(-1), value_estimate)
 
     # E_p[log(Gaussian(µ, σ, x))] = 1/2*log(2πσ^2) + 1/2 = 1/2 * log(2π) + log(σ) + 1/2
     # We only really care about the log(σ) part though, which is equal to log(var) up to a constant factor of 2.
-    entropy_bonus = logvars_base.sum(dim=-1).mean() + 1/2 * (1 + math.log(2 * np.pi))
+    entropy_bonus = logvars_base.sum(dim=-1).mean() + 1 / 2 * (1 + math.log(2 * np.pi))
 
     loss = policy_loss + vf_coef * vf_loss + -entropy_coef * entropy_bonus
     # Penalize really negative logvars
@@ -102,8 +138,9 @@ def ppo_loss(policy, policy_ref, V, V_targ, states, actions, rewards, epsilon=0.
         "vf": vf_loss.item(),
         "entropy": entropy_bonus.item(),
     }
-    
+
     return (loss, info)
+
 
 # Observation space is 51 dims.
 # Action space is [-1, 1]^9.
@@ -136,10 +173,12 @@ def do_episode(env, model):
 
     return (states, actions, rewards, truncated)
 
+
 def run_training():
     import torch
     import numpy as np
     import random
+
     torch.manual_seed(0)
     np.random.seed(0)
     random.seed(0)
@@ -158,8 +197,6 @@ def run_training():
         auto_reset=False,
         ignore_terminations=False,
     )
-    print(env.action_space)
-    print(env.reset()[0].shape)
 
     policy = Policy().to(device)
     policy_ref = Policy().to(device)
@@ -208,8 +245,11 @@ def run_training():
 
             pbar.set_postfix({**info, "reward": total_reward.item()})
             pbar.update()
-            with open(f'runs/{out_dir}/reward.jsonl', 'a') as f:
-                f.write(json.dumps({"epoch": epoch, **info, "reward": total_reward.item()}) + "\n")
+            with open(f"runs/{out_dir}/reward.jsonl", "a") as f:
+                f.write(
+                    json.dumps({"epoch": epoch, **info, "reward": total_reward.item()})
+                    + "\n"
+                )
 
             if (epoch + 1) % ckpt_every == 0:
                 torch.save(policy.state_dict(), f"runs/{out_dir}/ckpt_{epoch + 1}.pt")
@@ -217,9 +257,10 @@ def run_training():
             if (epoch + 1) % ckpt_every == 0:
                 torch.save(V.state_dict(), f"runs/{out_dir}/ckpt_{epoch + 1}_vf.pt")
 
+
 def eval():
     env = gym.make(
-        "RotateValveLevel0-v1",
+        "StackCube-v1",
         render_mode="rgb_array",
         sim_backend="gpu",
         control_mode="pd_joint_delta_pos",
@@ -227,17 +268,19 @@ def eval():
         num_envs=100,
     )
     policy = Policy().to(device)
-    policy.load_state_dict(torch.load("runs/18/ckpt_25.pt"))
+    policy.load_state_dict(torch.load("runs/31/ckpt_650.pt", weights_only=True))
 
     success = 0
     for i in range(100):
         states, actions, rewards, truncated = do_episode(env, policy)
         success += (~truncated).sum().item()
-        print((~truncated).sum())
-    
-    print(success/100)
-    
+        print((~truncated).sum().item())
 
-if __name__ == '__main__':
-    run_training()
-    # eval()
+    print(success / 100)
+
+
+if __name__ == "__main__":
+    if sys.argv[1] == "train":
+        run_training()
+    else:
+        eval()
