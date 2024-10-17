@@ -3,6 +3,7 @@ import os
 import time
 import numpy as np
 from mani_skill.utils.wrappers import RecordEpisode
+from mani_skill.vector.wrappers.gymnasium import ManiSkillVectorEnv
 import matplotlib.pyplot as plt
 import torch
 import torch.nn as nn
@@ -15,6 +16,8 @@ if torch.cuda.is_available():
     device = "cuda"
 else:
     device = "cpu"
+
+NUM_ENVS = 128
 
 def make_base(sizes):
     modules = []
@@ -56,35 +59,34 @@ def logprobs(means, logvars, actions):
     # We can omit the 2π because we ultimately care about probability ratio.
     return (0.5 * torch.pow(actions - means, 2)/torch.exp(logvars) - 0.5 * logvars).sum(axis=-1)
 
-def compute_advantages_via_td_residual(V, states, actions, rewards, next_states, gamma):
-    return (V(next_states) * gamma + rewards) - V(states)
-
 def reward_estimation(V, states, rewards, gamma, lambda_):
-    seqlen = states.shape[0]
-    td_lambda_estimate = torch.zeros(seqlen, device=device)
-    gae_estimate = torch.zeros(seqlen, device=device)
+    td_lambda_estimate = torch.zeros(states.shape[:-1], device=device)
+    gae_estimate = torch.zeros(states.shape[:-1], device=device)
     
     # Compute values for each state
     values = V(states)  # Assuming V is the value function network
     
     # Initialize eligibility trace
     eligibility_trace = 0
+    gae = 0
     
+    seqlen = states.shape[-2]
     for t in reversed(range(seqlen)):
-        delta = rewards[t] + (gamma * values[t + 1] if t + 1 < seqlen else 0) - values[t]
+        delta = rewards[..., t] + (gamma * values[..., t + 1] if t + 1 < seqlen else 0) - values[..., t]
         
         # Update eligibility trace with lambda_
         eligibility_trace = gamma * lambda_ * eligibility_trace + 1
+        gae = gamma * lambda_ * gae + delta
         
         # Update the TD(λ) estimate
-        td_lambda_estimate[t] = delta * eligibility_trace + values[t]
-        gae_estimate[t] = delta * eligibility_trace
+        td_lambda_estimate[..., t] = delta * eligibility_trace + values[..., t]
+        gae_estimate[..., t] = gae
     
     return td_lambda_estimate, gae_estimate
 
-def ppo_loss(policy, policy_ref, V, states, actions, rewards, epsilon=0.2, vf_coef=0.5, entropy_coef=0.01, gamma=0.9, lambda_=0.8):
-    states.squeeze_(-1)
-    actions.squeeze_(-1)
+def ppo_loss(policy, policy_ref, V, states, actions, rewards, epsilon=0.1, vf_coef=0.5, entropy_coef=0.01, gamma=0.9, lambda_=0.8):
+    # states.squeeze_(-1)
+    # actions.squeeze_(-1)
     next_states = states[1:]
     states = states[:-1]
 
@@ -98,7 +100,7 @@ def ppo_loss(policy, policy_ref, V, states, actions, rewards, epsilon=0.2, vf_co
     policy_loss = torch.min(advantage_estimate * logprob_ratio, advantage_estimate * torch.clamp(logprob_ratio, -epsilon, epsilon))
     policy_loss = policy_loss.sum(dim=-1).mean()
 
-    vf_loss = F.mse_loss(V(states), value_estimate)
+    vf_loss = F.mse_loss(V(states).squeeze(-1), value_estimate)
 
     # E_p[log(Gaussian(µ, σ, x))] = 1/2*log(2πσ^2) + 1/2 = 1/2 * log(2π) + log(σ) + 1/2
     # We only really care about the log(σ) part though, which is equal to log(var) up to a constant factor of 2.
@@ -133,7 +135,7 @@ def do_episode(model):
         obs, reward, terminated, truncated, info = env.step(action)
         rewards.append(reward)
 
-        done = terminated or truncated
+        done = terminated.any() or truncated.any()
 
     # Add terminal state.
     states.append(obs)
@@ -141,6 +143,8 @@ def do_episode(model):
     states = torch.stack(states).float()
     actions = torch.stack(actions).float()
     rewards = torch.stack(rewards).float()
+
+    print(states.shape, actions.shape, rewards.shape)
 
     return (states, actions, rewards, truncated)
 
@@ -150,15 +154,21 @@ env = gym.make(
     sim_backend="gpu",
     control_mode="pd_joint_delta_pos",
     obs_mode="state",
+    num_envs=NUM_ENVS,
 )
-env = RecordEpisode(
+env = ManiSkillVectorEnv(
     env,
-    output_dir="Videos",
-    save_trajectory=False,
-    save_video=True,
-    video_fps=30,
-    max_steps_per_video=100,
+    auto_reset=True,
+    ignore_terminations=False,
 )
+# env = RecordEpisode(
+#     env,
+#     output_dir="Videos",
+#     save_trajectory=False,
+#     save_video=True,
+#     video_fps=30,
+#     max_steps_per_video=100,
+# )
 
 # obs, info = env.reset()
 # print(info)
@@ -166,12 +176,17 @@ policy = Policy().to(device)
 policy_ref = Policy().to(device)
 policy_ref.load_state_dict(policy_ref.state_dict())
 V = ValueNetwork().to(device)
-optimizer = torch.optim.Adam([*policy.parameters(), *V.parameters()])
+optimizer = torch.optim.Adam([*policy.parameters(), *V.parameters()], lr=1e-4)
 
 epochs = 10000
 ckpt_every = 200
 buffer_episodes = 20
 # buffer_epochs = 10
+
+out_dir = 0
+while os.path.exists("runs/" + str(out_dir)):
+    out_dir += 1
+os.makedirs("runs/" + str(out_dir))
 
 with tqdm.tqdm(total=epochs) as pbar:
     for epoch in range(epochs):
@@ -192,20 +207,22 @@ with tqdm.tqdm(total=epochs) as pbar:
             states,
             actions,
             rewards,
+            epsilon=0.03,
         )
         optimizer.zero_grad()
         loss.backward()
+        nn.utils.clip_grad_norm_([*policy.parameters(), *V.parameters()], 1.0)
         optimizer.step()
-        total_reward = sum(rewards)
+        total_reward = rewards.sum(0).mean()
         pbar.set_postfix({**info, "reward": total_reward.item()})
         pbar.update()
         if (epoch + 1) % 10 == 0:
             policy_ref.load_state_dict(policy.state_dict())
         
         if (epoch + 1) % ckpt_every == 0:
-            torch.save(policy_ref.state_dict(), f"ckpt_{epoch + 1}.pt")
+            torch.save(policy_ref.state_dict(), f"runs/{out_dir}/ckpt_{epoch + 1}.pt")
 
-        with open('reward.jsonl', 'a') as f:
+        with open(f'runs/{out_dir}/reward.jsonl', 'a') as f:
             f.write(json.dumps({"epoch": epoch, **info, "reward": total_reward.item()}) + "\n")
 
 """
