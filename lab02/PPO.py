@@ -1,18 +1,19 @@
-import gymnasium as gym
+import json
+import math
 import os
+import sys
 import time
-import numpy as np
-from mani_skill.utils.wrappers import RecordEpisode
-from mani_skill.vector.wrappers.gymnasium import ManiSkillVectorEnv
+
+import gymnasium as gym
 import matplotlib.pyplot as plt
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import math
 import tqdm
-import json
-import sys
 import wandb
+from mani_skill.utils.wrappers import RecordEpisode
+from mani_skill.vector.wrappers.gymnasium import ManiSkillVectorEnv
 
 if torch.cuda.is_available():
     device = "cuda"
@@ -144,6 +145,7 @@ def ppo_update(
 
         optimizer.zero_grad()
         torch.nn.utils.clip_grad_norm_([*policy.parameters(), *V.parameters()], grad_clip_norm)
+        loss.backward()
         optimizer.step()
 
         policy_losses.append(policy_loss.item())
@@ -192,9 +194,10 @@ def do_episode(env, model):
 
 
 def run_training():
-    import torch
-    import numpy as np
     import random
+
+    import numpy as np
+    import torch
 
     torch.manual_seed(0)
     np.random.seed(0)
@@ -258,7 +261,7 @@ def run_training():
                 states,
                 actions,
                 rewards,
-                epsilon=0.1,
+                epsilon=0.2,
                 num_iterations=ppo_update_iterations,
             )
 
