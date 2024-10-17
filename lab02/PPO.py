@@ -12,6 +12,7 @@ import math
 import tqdm
 import json
 import sys
+import wandb
 
 if torch.cuda.is_available():
     device = "cuda"
@@ -86,7 +87,8 @@ def reward_estimation(V, states, rewards, gamma, lambda_):
     return gae_estimate + values, gae_estimate
 
 
-def ppo_loss(
+def ppo_update(
+    optimizer,
     policy,
     policy_ref,
     V,
@@ -99,39 +101,54 @@ def ppo_loss(
     entropy_coef=0.1,
     gamma=0.98,
     lambda_=0.96,
+    grad_clip_norm=1.0,
     normalize_advantages=True,
+    num_iterations=10,
 ):
     states = states[:-1]
-
-    means_base, logvars_base_ = policy(states)
-    logvars_base = torch.max(torch.tensor(-4.0, device=device), logvars_base_)
-    logprobs_base = logprobs(means_base, logvars_base, actions)
     with torch.no_grad():
         value_estimate, advantage_estimate = reward_estimation(
             V_targ, states, rewards, gamma, lambda_
         )
         logprobs_ref = logprobs(*policy_ref(states), actions)
-    logprob_ratio = logprobs_base - logprobs_ref
-    prob_ratio = torch.exp(logprob_ratio)
 
-    if normalize_advantages:
-        advantage_estimate = (advantage_estimate - advantage_estimate.mean()) / (1e-8 + advantage_estimate.std())
+    policy_losses = []
+    vf_losses = []
+    entropy_bonuses = []
 
-    policy_loss = -torch.min(
-        advantage_estimate * prob_ratio,
-        advantage_estimate * torch.clamp(prob_ratio, -epsilon, epsilon),
-    )
-    policy_loss = policy_loss.sum(dim=-1).mean()
+    for iter_ in range(num_iterations):
+        means_base, logvars_base_ = policy(states)
+        logvars_base = torch.max(torch.tensor(-4.0, device=device), logvars_base_)
+        logprobs_base = logprobs(means_base, logvars_base, actions)
+        logprob_ratio = logprobs_base - logprobs_ref
+        prob_ratio = torch.exp(logprob_ratio)
 
-    vf_loss = F.mse_loss(V(states).squeeze(-1), value_estimate)
+        if normalize_advantages:
+            advantage_estimate = (advantage_estimate - advantage_estimate.mean()) / (1e-8 + advantage_estimate.std())
 
-    # E_p[log(Gaussian(µ, σ, x))] = 1/2*log(2πσ^2) + 1/2 = 1/2 * log(2π) + log(σ) + 1/2
-    # We only really care about the log(σ) part though, which is equal to log(var) up to a constant factor of 2.
-    entropy_bonus = logvars_base.sum(dim=-1).mean() + 1 / 2 * (1 + math.log(2 * np.pi))
+        policy_loss = -torch.min(
+            advantage_estimate * prob_ratio,
+            advantage_estimate * torch.clamp(prob_ratio, 1 - epsilon, 1 + epsilon),
+        )
+        policy_loss = policy_loss.sum(dim=-1).mean()
 
-    loss = policy_loss + vf_coef * vf_loss + -entropy_coef * entropy_bonus
-    # Penalize really negative logvars
-    loss = loss + (-1) * ((logvars_base_ < -4) * logvars_base_).mean()
+        vf_loss = F.mse_loss(V(states).squeeze(-1), value_estimate)
+
+        # E_p[log(Gaussian(µ, σ, x))] = 1/2*log(2πσ^2) + 1/2 = 1/2 * log(2π) + log(σ) + 1/2
+        # We only really care about the log(σ) part though, which is equal to log(var) up to a constant factor of 2.
+        entropy_bonus = logvars_base.sum(dim=-1).mean() + 1 / 2 * (1 + math.log(2 * np.pi))
+
+        loss = policy_loss + vf_coef * vf_loss + -entropy_coef * entropy_bonus
+        # Penalize really negative logvars
+        # loss = loss + (-1) * ((logvars_base_ < -4) * logvars_base_).mean()
+
+        optimizer.zero_grad()
+        torch.nn.utils.clip_grad_norm_([*policy.parameters(), *V.parameters()], grad_clip_norm)
+        optimizer.step()
+
+        policy_losses.append(policy_loss.item())
+        vf_losses.append(vf_loss.item())
+        entropy_bonuses.append(entropy_bonus.item())
 
     info = {
         "policy": policy_loss.item(),
@@ -216,6 +233,11 @@ def run_training():
         out_dir += 1
     os.makedirs("runs/" + str(out_dir))
 
+    wandb.init(
+        project="cs6501-lab02-ppo",
+        name="run_" + str(out_dir)
+    )
+
     with tqdm.tqdm(total=epochs) as pbar:
         for epoch in range(epochs):
             policy_ref.load_state_dict(policy.state_dict())
@@ -227,21 +249,18 @@ def run_training():
             total_reward = rewards.sum(0).mean()
 
             # Run a pass over the data.
-            for ppo_update_iteration in range(ppo_update_iterations):
-                loss, info = ppo_loss(
-                    policy,
-                    policy_ref,
-                    V,
-                    V_targ,
-                    states,
-                    actions,
-                    rewards,
-                    epsilon=0.1,
-                )
-                optimizer.zero_grad()
-                loss.backward()
-                nn.utils.clip_grad_norm_([*policy.parameters(), *V.parameters()], 1.0)
-                optimizer.step()
+            loss, info = ppo_update(
+                optimizer,
+                policy,
+                policy_ref,
+                V,
+                V_targ,
+                states,
+                actions,
+                rewards,
+                epsilon=0.1,
+                num_iterations=ppo_update_iterations,
+            )
 
             pbar.set_postfix({**info, "reward": total_reward.item()})
             pbar.update()
@@ -250,6 +269,12 @@ def run_training():
                     json.dumps({"epoch": epoch, **info, "reward": total_reward.item()})
                     + "\n"
                 )
+
+            wandb.log({
+                "epoch": epoch,
+                **info,
+                "reward": total_reward.item(),
+            })
 
             if (epoch + 1) % ckpt_every == 0:
                 torch.save(policy.state_dict(), f"runs/{out_dir}/ckpt_{epoch + 1}.pt")
