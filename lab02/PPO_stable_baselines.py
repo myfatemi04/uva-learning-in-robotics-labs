@@ -23,16 +23,29 @@ else:
 
 NUM_ENVS = 128
 env = gym.make(
-    # "RotateValveLevel0-v1",
     "StackCube-v1",
     render_mode="rgb_array",
     sim_backend="gpu",
     control_mode="pd_joint_delta_pos",
     obs_mode="state",
-    num_envs=NUM_ENVS,
 )
+env = ManiSkillVectorEnv(
+    env,
+    auto_reset=False,
+    ignore_terminations=False,
+)
+orig_reset = env.reset
+orig_step = env.step
+def alt_reset(*args, **kwargs):
+    obs, arg = orig_reset(*args, **kwargs)
+    return obs.detach().cpu().numpy(), arg
+def alt_step(*args, **kwargs):
+    obs, *args = orig_step(*args, **kwargs)
+    return obs.detach().cpu().numpy(), *args
+env.reset = alt_reset
+env.step = alt_step
 
-model = PPO("MlpPolicy", env, verbose=1)
+model = PPO("MlpPolicy", env, verbose=1, device=device)
 model.learn(total_timesteps=10_000)
 
 vec_env = model.get_env()
@@ -40,7 +53,6 @@ obs = vec_env.reset()
 for i in range(1000):
     action, _states = model.predict(obs, deterministic=True)
     obs, reward, done, info = vec_env.step(action)
-    vec_env.render()
     # VecEnv resets automatically
     # if done:
     #   obs = env.reset()

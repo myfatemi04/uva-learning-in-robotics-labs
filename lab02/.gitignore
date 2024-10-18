@@ -2,3 +2,6 @@
 *.png
 reward.jsonl
 wandb
+env
+runs
+__pycache__
