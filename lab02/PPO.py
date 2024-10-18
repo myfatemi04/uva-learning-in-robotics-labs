@@ -13,8 +13,9 @@ import torch.nn.functional as F
 import torch.optim
 import tqdm
 import wandb
-from mani_skill.utils.wrappers import RecordEpisode
+from mani_skill.utils.wrappers import FlattenActionSpaceWrapper, RecordEpisode
 from mani_skill.vector.wrappers.gymnasium import ManiSkillVectorEnv
+from torch.distributions import Normal
 
 if torch.cuda.is_available():
     device = "cuda"
@@ -63,18 +64,50 @@ class Rollout:
         gamma: float,
         lambda_: float,
         normalize_advantages: bool,
+        finite_horizon_gae: bool,
     ):
         advantages = torch.zeros(states.shape[:-1], device=device)
         gae = 0
-
         seqlen = actions.shape[0]
-        for t in reversed(range(seqlen)):
-            delta = rewards[t] + gamma * value_estimates[t + 1] - value_estimates[t]
 
-            # If action t received a "done" signal, then future rewards should not percolate beyond
-            # episode boundaries.
-            gae = gamma * lambda_ * gae * (~dones[t]) + delta
-            advantages[t] = gae
+        if not finite_horizon_gae:
+            for t in reversed(range(seqlen)):
+                delta = rewards[t] + gamma * value_estimates[t + 1] - value_estimates[t]
+
+                # If action t received a "done" signal, then future rewards should not percolate beyond
+                # episode boundaries.
+                gae = gamma * lambda_ * gae * (~dones[t]) + delta
+                advantages[t] = gae
+        else:
+            lambda_coefficient_sum = 0
+            reward_term_sum = 0
+            value_term_sum = 0
+            for t in reversed(range(seqlen)):
+                # Reinitialize the sums for any environments which just terminated their episode.
+                lambda_coefficient_sum = lambda_coefficient_sum * (~dones[t])
+                reward_term_sum = reward_term_sum * (~dones[t])
+                value_term_sum = value_term_sum * (~dones[t])
+
+                # Sort of inductive.
+                # The r_t sum is gamma * r_{t + 1} sum + r_t times the current lambda coefficient sum.
+                # This is based on the implementation in the Maniskill baseline.
+                """
+                1             *(  -V(s_t)  + r_t                                                               + gamma * V(s_{t+1})   )
+                lambda        *(  -V(s_t)  + r_t + gamma * r_{t+1}                                             + gamma^2 * V(s_{t+2}) )
+                lambda^2      *(  -V(s_t)  + r_t + gamma * r_{t+1} + gamma^2 * r_{t+2}                         + ...                  )
+                lambda^3      *(  -V(s_t)  + r_t + gamma * r_{t+1} + gamma^2 * r_{t+2} + gamma^3 * r_{t+3}
+                """
+                lambda_coefficient_sum = 1 + lambda_ * lambda_coefficient_sum
+                reward_term_sum = (
+                    lambda_ * gamma * reward_term_sum
+                    + lambda_coefficient_sum * rewards[t]
+                )
+                value_term_sum = (
+                    lambda_ * gamma * value_term_sum + gamma * value_estimates[t + 1]
+                )
+                advantages[t] = (
+                    reward_term_sum + value_term_sum
+                ) / lambda_coefficient_sum - value_estimates[t]
 
         returns = advantages + value_estimates
         if normalize_advantages:
@@ -129,19 +162,19 @@ class ActionStep:
     actions: torch.Tensor
 
 
-def compute_logprobs(
-    means: torch.Tensor, logstds: torch.Tensor, actions: torch.Tensor
-) -> torch.Tensor:
-    # log(Gaussian(µ, σ, x)) = -1/2 * ((x - µ)/σ)^2 - log(sqrt(2π)σ)
-    # We can omit the 2π because we ultimately care about probability ratio.
-    return (-0.5 * (actions - means) ** 2 / (1e-8 + torch.exp(logstds)) - logstds).sum(
-        dim=-1
-    )
+# def compute_logprobs(
+#     means: torch.Tensor, logstds: torch.Tensor, actions: torch.Tensor
+# ) -> torch.Tensor:
+#     # log(Gaussian(µ, σ, x)) = -1/2 * ((x - µ)/σ)^2 - log(sqrt(2π)σ)
+#     # We can omit the 2π because we ultimately care about probability ratio.
+#     return (-0.5 * (actions - means) ** 2 / (1e-8 + torch.exp(logstds)) - logstds).sum(
+#         dim=-1
+#     )
 
 
-def compute_entropy(logstds: torch.Tensor):
-    # E_p[log(Gaussian(µ, σ, x))] = 1/2*log(2πσ^2) + 1/2 = 1/2 * log(2π) + log(σ) + 1/2
-    return 0.5 * (1 + math.log(2 * math.pi)) + logstds.sum(dim=-1).mean()
+# def compute_entropy(logstds: torch.Tensor):
+#     # E_p[log(Gaussian(µ, σ, x))] = 1/2*log(2πσ^2) + 1/2 = 1/2 * log(2π) + log(σ) + 1/2
+#     return 0.5 * (1 + math.log(2 * math.pi)) + logstds.sum(dim=-1).mean()
 
 
 def layer_init(layer: nn.Linear, std=np.sqrt(2), bias_const=0.0):
@@ -168,16 +201,20 @@ class ActorCritic(nn.Module):
 
         self.actor_base = make_base([state_dim, 256, 256, 256])
         self.mean_head = nn.Linear(256, action_dim)
-        self.logstd = nn.Parameter(
-            -1 / 2 * torch.ones(1, action_dim), requires_grad=True
-        )
+        layer_init(self.mean_head, std=0.01 * np.sqrt(2))
+        self.logstd = nn.Parameter(-0.5 * torch.ones(1, action_dim), requires_grad=True)
         self.critic = make_critic(state_dim)
         self.critic_target = make_critic(state_dim)
         self.critic_target.load_state_dict(self.critic.state_dict())
         self.critic_target.requires_grad_(False)
 
-    def synchronize_critics(self):
-        self.critic_target.load_state_dict(self.critic.state_dict())
+    def synchronize_critics(self, beta: float):
+        # Exponential moving average
+        with torch.no_grad():
+            for param, target_param in zip(
+                self.critic.parameters(), self.critic_target.parameters()
+            ):
+                target_param.data = beta * target_param.data + (1 - beta) * param.data
 
     def actor(self, states: torch.Tensor):
         x_actor = self.actor_base(states)
@@ -187,10 +224,18 @@ class ActorCritic(nn.Module):
 
     def sample_action(self, states: torch.Tensor, deterministic: bool):
         means, logstds = self.actor(states)
-        actions = means + (
-            torch.randn_like(means) * torch.exp(logstds / 2) if not deterministic else 0
-        )
-        logprobs = compute_logprobs(means, logstds, actions)
+        dist = Normal(means, torch.exp(logstds))
+        if deterministic:
+            actions = means
+        else:
+            actions = dist.sample()
+
+        # Clamp to action space.
+        actions = torch.clamp(actions, -1, 1)
+
+        # Sum across all action dimensions.
+        # Shape is [batch_size, num_action-dimensions]
+        logprobs = dist.log_prob(actions).sum(-1)
 
         return (actions, logprobs)
 
@@ -198,7 +243,7 @@ class ActorCritic(nn.Module):
         return self.critic(states).squeeze(-1)
 
     def value_target(self, states: torch.Tensor) -> torch.Tensor:
-        return self.critic_target(states).squeeze(-1)
+        return self.critic(states).squeeze(-1)
 
 
 def ppo_update(
@@ -231,8 +276,12 @@ def ppo_update(
 
             values = model.value(rollout_minibatch.states)
             means, logstds = model.actor(rollout_minibatch.states)
-            logprobs = compute_logprobs(means, logstds, rollout_minibatch.actions)
-            entropy = compute_entropy(logstds)
+            dist = Normal(means, torch.exp(logstds))
+
+            # Shape: [batch_size, num_action_dimensions]
+            # Therefore, we sum logprobs and entropy across all action dimensions.
+            logprobs = dist.log_prob(rollout_minibatch.actions).sum(-1)
+            entropy = dist.entropy().sum(-1).mean()
 
             log_ratio = logprobs - rollout_minibatch.logprobs
             ratio = torch.exp(log_ratio)
@@ -273,6 +322,7 @@ def run_rollout(
     gamma: float,
     lambda_: float,
     normalize_advantages: bool,
+    finite_horizon_gae: bool,
 ) -> Rollout:
     obs, info = env.reset()
     states = []
@@ -292,7 +342,7 @@ def run_rollout(
         logprobs.append(logprobs_)
         value_estimates.append(values)
 
-        obs, reward, terminated, truncated, info = env.step(actions)
+        obs, reward, terminated, truncated, info = env.step(actions_)
 
         rewards.append(reward)
         dones.append(terminated | truncated)
@@ -321,6 +371,7 @@ def run_rollout(
         gamma,
         lambda_,
         normalize_advantages,
+        finite_horizon_gae,
     )
 
 
@@ -333,15 +384,16 @@ def run_training():
     CHECKPOINT_EVERY = 25
     PPO_ITERATIONS = 4
     VF_COEFFICIENT = 0.5
-    VF_SYNCHRONIZE_EVERY = 4
+    VF_SYNCHRONIZE_BETA = 0.9
     CLIP_COEFFICIENT = 0.2
     ENTROPY_COEFFICIENT = 0.0
-    GRADIENT_CLIPPING_NORM = 1.0
+    GRADIENT_CLIPPING_NORM = 0.5
     NORMALIZE_ADVANTAGES = True
     MINIBATCH_SIZE = 800
     GAMMA = 0.8
     LAMBDA = 0.9
     TARGET_KL = 0.1
+    FINITE_HORIZON_GAE = True
 
     torch.manual_seed(SEED)
     np.random.seed(SEED)
@@ -358,9 +410,15 @@ def run_training():
     env = ManiSkillVectorEnv(
         env,  # type: ignore
         auto_reset=False,
-        ignore_terminations=True,
+        ignore_terminations=False,
         record_metrics=True,
     )
+    if isinstance(env.action_space, gym.spaces.Dict):
+        env = FlattenActionSpaceWrapper(env)
+    assert isinstance(
+        env.single_action_space, gym.spaces.Box
+    ), "only continuous action space is supported"
+
     state_dim: int = env.single_observation_space.shape[0]  # type: ignore
     action_dim: int = env.single_action_space.shape[0]  # type: ignore
     model = ActorCritic(state_dim, action_dim).to(device)
@@ -382,12 +440,13 @@ def run_training():
             "checkpoint_every": CHECKPOINT_EVERY,
             "ppo_iterations": PPO_ITERATIONS,
             "vf_coefficient": VF_COEFFICIENT,
-            "vf_synchronize_every": VF_SYNCHRONIZE_EVERY,
+            "vf_synchronize_beta": VF_SYNCHRONIZE_BETA,
             "clip_coefficient": CLIP_COEFFICIENT,
             "entropy_coefficient": ENTROPY_COEFFICIENT,
             "gradient_clipping_norm": GRADIENT_CLIPPING_NORM,
             "normalize_advantages": NORMALIZE_ADVANTAGES,
             "minibatch_size": MINIBATCH_SIZE,
+            "finite_horizon_gae": FINITE_HORIZON_GAE,
             "gamma": GAMMA,
             "lambda": LAMBDA,
             "target_kl": TARGET_KL,
@@ -406,6 +465,7 @@ def run_training():
                 gamma=GAMMA,
                 lambda_=LAMBDA,
                 normalize_advantages=NORMALIZE_ADVANTAGES,
+                finite_horizon_gae=FINITE_HORIZON_GAE,
             )
             train_returns = rollout.returns.sum(0).mean().item()
             train_rewards = rollout.rewards.sum(0).mean().item()
@@ -421,8 +481,7 @@ def run_training():
                     )
 
             # Run a pass over the data.
-            if (epoch + 1) % VF_SYNCHRONIZE_EVERY == 0:
-                model.synchronize_critics()
+            # model.synchronize_critics(VF_SYNCHRONIZE_BETA)
             losses = ppo_update(
                 optimizer,
                 model,
@@ -455,10 +514,10 @@ def eval():
     random.seed(0)
 
     ENV = "PickCube-v1"
-    NUM_ENVS = 100
-    DO_RECORDING = False
-    # NUM_ENVS = 1
-    # DO_RECORDING = True
+    # NUM_ENVS = 100
+    # DO_RECORDING = False
+    NUM_ENVS = 1
+    DO_RECORDING = True
 
     assert not DO_RECORDING or NUM_ENVS == 1, "NUM_ENVS must be 1 if recording."
 
@@ -487,7 +546,7 @@ def eval():
         env.single_observation_space.shape[0],  # type: ignore
         env.single_action_space.shape[0],  # type: ignore
     ).to(device)
-    model.load_state_dict(torch.load("runs/77/ckpt_125.pt", weights_only=True))
+    model.load_state_dict(torch.load("runs/89/ckpt_325.pt", weights_only=True))
 
     rollout = run_rollout(
         env,
@@ -497,6 +556,7 @@ def eval():
         gamma=0,
         lambda_=0,
         normalize_advantages=False,
+        finite_horizon_gae=False,
     )
     stats = {}
     for done_mask, info in zip(rollout.dones, rollout.infos):
