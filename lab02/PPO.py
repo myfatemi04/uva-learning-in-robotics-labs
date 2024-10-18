@@ -1,15 +1,15 @@
-import json
 import math
 import os
+import random
 import sys
-import time
+from dataclasses import dataclass
 
 import gymnasium as gym
-import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.optim
 import tqdm
 import wandb
 from mani_skill.utils.wrappers import RecordEpisode
@@ -20,18 +20,134 @@ if torch.cuda.is_available():
 else:
     device = "cpu"
 
-NUM_ENVS = 512
-# ENV = "OpenCabinetDrawer-v1"
-# STATE_DIM = 44
-# ACTION_DIM = 13
-ENV = "PickCube-v1"
-STATE_DIM = 42
-ACTION_DIM = 8
+BLANK_TENSOR = torch.tensor(0)
 
-def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
+
+@dataclass
+class Rollout:
+    states: torch.Tensor
+    actions: torch.Tensor
+    rewards: torch.Tensor
+    logprobs: torch.Tensor
+    dones: (
+        torch.Tensor
+    )  # dones[t] indicates that after taking action[t], a "done" signal was received.
+    infos: list[dict]
+    returns: torch.Tensor
+    advantages: torch.Tensor
+
+    def flatten(self):
+        return Rollout(
+            # Remove the "final" state.
+            self.states[:-1].reshape((-1, self.states.shape[-1])),
+            self.actions.reshape((-1, self.actions.shape[-1])),
+            self.rewards.reshape((-1,)),
+            self.logprobs.reshape((-1,)),
+            # note: "dones" and "infos" lose their meaning when flattened.
+            BLANK_TENSOR,  # self.dones.reshape((-1,)),
+            [],  # self.infos,
+            self.returns.reshape((-1,)),
+            self.advantages.reshape((-1,)),
+        )
+
+    @staticmethod
+    def from_raw_states(
+        states: torch.Tensor,
+        actions: torch.Tensor,
+        rewards: torch.Tensor,
+        logprobs: torch.Tensor,
+        dones: torch.Tensor,
+        value_estimates: torch.Tensor,
+        infos: list[dict],
+        gamma: float,
+        lambda_: float,
+        normalize_advantages: bool,
+    ):
+        advantages = torch.zeros(states.shape[:-1], device=device)
+        gae = 0
+
+        seqlen = actions.shape[0]
+        for t in reversed(range(seqlen)):
+            delta = rewards[t] + gamma * value_estimates[t + 1] - value_estimates[t]
+
+            # If action t received a "done" signal, then future rewards should not percolate beyond
+            # episode boundaries.
+            gae = gamma * lambda_ * gae * (1.0 - dones[t]) + delta
+            advantages[t] = gae
+
+        returns = advantages + value_estimates
+        if normalize_advantages:
+            advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+
+        return Rollout(
+            states,
+            actions,
+            rewards,
+            logprobs,
+            dones,
+            infos,
+            returns,
+            advantages,
+        )
+
+    def sample_batch(self, batch_size: int):
+        indexes = torch.randperm(self.states.shape[0])[:batch_size]
+        return Rollout(
+            self.states[indexes],
+            self.actions[indexes],
+            self.rewards[indexes],
+            self.logprobs[indexes],
+            BLANK_TENSOR,  # self.dones[indexes],
+            [],  # self.infos[indexes],
+            self.returns[indexes],
+            self.advantages[indexes],
+        )
+
+    def __getitem__(self, slice):
+        return Rollout(
+            self.states[slice],
+            self.actions[slice],
+            self.rewards[slice],
+            self.logprobs[slice],
+            BLANK_TENSOR,  # self.dones[slice],
+            [],  # self.infos[slice],
+            self.returns[slice],
+            self.advantages[slice],
+        )
+
+    def __len__(self):
+        return self.actions.shape[0]
+
+
+@dataclass
+class ActionStep:
+    mean: torch.Tensor
+    logstd: torch.Tensor
+    logprobs: torch.Tensor
+    values: torch.Tensor
+    actions: torch.Tensor
+
+
+def compute_logprobs(
+    means: torch.Tensor, logstds: torch.Tensor, actions: torch.Tensor
+) -> torch.Tensor:
+    # log(Gaussian(µ, σ, x)) = -1/2 * ((x - µ)/σ)^2 - log(sqrt(2π)σ)
+    # We can omit the 2π because we ultimately care about probability ratio.
+    return (-0.5 * (actions - means) ** 2 / (1e-8 + torch.exp(logstds)) - logstds).sum(
+        dim=-1
+    )
+
+
+def compute_entropy(logstds: torch.Tensor):
+    # E_p[log(Gaussian(µ, σ, x))] = 1/2*log(2πσ^2) + 1/2 = 1/2 * log(2π) + log(σ) + 1/2
+    return 0.5 * (1 + math.log(2 * math.pi)) + logstds.mean()
+
+
+def layer_init(layer: nn.Linear, std=np.sqrt(2), bias_const=0.0):
     torch.nn.init.orthogonal_(layer.weight, std)
     torch.nn.init.constant_(layer.bias, bias_const)
     return layer
+
 
 def make_base(sizes):
     modules = []
@@ -41,212 +157,190 @@ def make_base(sizes):
     return nn.Sequential(*modules)
 
 
-class Policy(nn.Module):
-    def __init__(self, state_dim=STATE_DIM, act_dim=ACTION_DIM):
-        super().__init__()
-
-        self.base = make_base([state_dim, 256, 256, 256])
-        self.mean_head = nn.Linear(256, act_dim)
-        # self.logvar_head = nn.Linear(64, act_dim)
-        self.logvar = nn.Parameter(-torch.ones(1, act_dim), requires_grad=True)
-
-    def forward(self, states: torch.Tensor):
-        x = self.base(states)
-        # mean: (-1, 1)
-        mean = F.tanh(self.mean_head(x))
-        # logvar: (-infty, 0] so that variance is in range (0, 1]
-        # logvar = -F.elu(self.logvar_head(x))
-        return mean, self.logvar.expand_as(mean)
-
-
-class ValueNetwork(nn.Module):
-    def __init__(self, state_dim=STATE_DIM):
-        super().__init__()
-
-        self.base = make_base([state_dim, 256, 256, 256])
+class ActorCritic(nn.Module):
+    def __init__(self, state_dim: int, action_dim: int):
+        self.actor_base = make_base([state_dim, 256, 256, 256])
+        self.critic_base = make_base([state_dim, 256, 256, 256])
+        self.mean_head = nn.Linear(256, action_dim)
+        self.logstd = nn.Parameter(
+            -1 / 2 * torch.ones(1, action_dim), requires_grad=True
+        )
         self.value_head = nn.Linear(256, 1)
 
-    def forward(self, states: torch.Tensor):
-        x = self.base(states)
-        value = self.value_head(x)
-        return value[..., 0]
+    def forward(
+        self, states: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        x_actor = self.actor_base(states)
+        x_critic = self.critic_base(states)
 
+        mean = F.tanh(self.mean_head(x_actor))
+        logstd = self.logstd.expand_as(mean)
+        value = self.value_head(x_critic).squeeze(-1)
 
-def logprobs(means, logvars, actions):
-    # log(Gaussian(µ, σ, x)) = -1/2 * ((x - µ)/σ)^2 - log(sqrt(2π)σ)
-    # We can omit the 2π because we ultimately care about probability ratio.
-    return (
-        -0.5 * torch.pow(actions - means, 2) / (1e-8 + torch.exp(logvars)) - 0.5 * logvars
-    ).sum(axis=-1)
+        return mean, logstd, value
 
-
-def reward_estimation(V, states, rewards, dones, gamma, lambda_):
-    gae_estimate = torch.zeros(states.shape[:-1], device=device)
-    values = V(states)
-    gae = 0
-
-    seqlen = states.shape[0] - 1
-    for t in reversed(range(seqlen)):
-        delta = (
-            rewards[t]
-            + (gamma * values[t + 1] if t + 1 < seqlen else 0)
-            - values[t]
+    def sample_action(self, states: torch.Tensor, deterministic: bool) -> ActionStep:
+        means, logstds, values = self(states)
+        actions = means + (
+            torch.randn_like(means) * torch.exp(logstds / 2) if not deterministic else 0
         )
-        gae = gamma * lambda_ * gae * (1.0 - dones[t + 1]) + delta
-        gae_estimate[t] = gae
+        logprobs = compute_logprobs(means, logstds, actions)
 
-    # returns and advantages
-    return gae_estimate + values, gae_estimate
+        return ActionStep(
+            means,
+            logstds,
+            logprobs,
+            values,
+            actions,
+        )
+
+    def value_logprob_entropy(
+        self, states: torch.Tensor, actions: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        means, logstds, values = self(states)
+        logprobs = compute_logprobs(means, logstds, actions)
+        entropy = compute_entropy(logstds)
+        return values, logprobs, entropy
 
 
 def ppo_update(
-    optimizer,
-    policy,
-    policy_ref,
-    V,
-    V_targ,
-    states,
-    actions,
-    rewards,
-    dones,
-    epsilon=0.1,
-    vf_coef=1.0,
-    entropy_coef=0.1,
-    gamma=0.98,
-    lambda_=0.96,
-    grad_clip_norm=1.0,
-    target_kl=0.1,
-    normalize_advantages=True,
-    num_iterations=4,
-    minibatch_size=800,
-):
-    states = states[:-1]
-    with torch.no_grad():
-        return_estimate, advantage_estimate = reward_estimation(
-            V_targ, states, rewards, dones, gamma, lambda_
-        )
-        logprobs_ref = logprobs(*policy_ref(states), actions)
+    optimizer: torch.optim.optimizer.Optimizer,
+    model: ActorCritic,
+    rollout: Rollout,
+    clip_coefficient: float,
+    vf_coef: float,
+    entropy_coef: float,
+    grad_clip_norm: float,
+    target_kl: float,
+    num_iterations: int,
+    minibatch_size: int,
+) -> dict:
+    rollout_flat = rollout.flatten()
 
-    if normalize_advantages:
-        advantage_estimate = (advantage_estimate - advantage_estimate.mean()) / (
-            1e-8 + advantage_estimate.std()
-        )
+    info = {
+        "policy_loss": [],
+        "vf_loss": [],
+        "entropy": [],
+        "approx_kl": [],
+    }
 
-    # flatten.
-    states_flat = states.reshape((-1, states.shape[-1]))
-    return_estimates_flat = return_estimate.reshape((-1,))
-    advantage_estimates_flat = advantage_estimate.reshape((-1,))
-    logprobs_ref_flat = logprobs_ref.reshape((-1,))
-    actions_flat = actions.reshape((-1, actions.shape[-1]))
-    indices = np.arange(states.shape[0])
-
-    policy_losses = []
-    vf_losses = []
-    entropy_bonuses = []
-
-    for iter_ in range(num_iterations):
-        np.random.shuffle(indices)
+    for _ in range(num_iterations):
+        indices = torch.randperm(len(rollout_flat), device=device)
 
         for i in range(0, len(indices), minibatch_size):
-            minibatch_indices = indices[i:i + minibatch_size]
+            minibatch_indices = indices[i : i + minibatch_size]
+            rollout_minibatch = rollout_flat[minibatch_indices]
 
-            means_base, logvars_base = policy(states_flat[minibatch_indices])
-            # logvars_base = torch.max(torch.tensor(-8.0, device=device), logvars_base_)
-            logprobs_base = logprobs(means_base, logvars_base, actions_flat[minibatch_indices])
-            logprob_ratio = logprobs_base - logprobs_ref_flat[minibatch_indices]
-            prob_ratio = torch.exp(logprob_ratio)
+            values, logprobs, entropy = model.value_logprob_entropy(
+                rollout_minibatch.states, rollout_minibatch.actions
+            )
+            log_ratio = logprobs - rollout_minibatch.logprobs
+            ratio = torch.exp(log_ratio)
+
+            # See if we need to stop early because KL divergence is too high.
+            with torch.no_grad():
+                approx_kl = ((ratio - 1) - log_ratio).mean().item()
+                if target_kl is not None and approx_kl > target_kl:
+                    break
 
             policy_loss = -torch.min(
-                advantage_estimates_flat[minibatch_indices] * prob_ratio,
-                advantage_estimates_flat[minibatch_indices] * torch.clamp(prob_ratio, 1 - epsilon, 1 + epsilon),
-            )
-            policy_loss = policy_loss.mean()
-
-            vf_loss = F.mse_loss(
-                V(states_flat[minibatch_indices]),
-                return_estimates_flat[minibatch_indices],
-            )
-
-            # E_p[log(Gaussian(µ, σ, x))] = 1/2*log(2πσ^2) + 1/2 = 1/2 * log(2π) + log(σ) + 1/2
-            # We only really care about the log(σ) part though, which is equal to log(var) up to a constant factor of 2.
-            entropy_bonus = logvars_base.sum(dim=-1).mean() + 1 / 2 * (
-                1 + math.log(2 * np.pi)
-            )
-
-            loss = policy_loss + vf_coef * vf_loss + -entropy_coef * entropy_bonus
+                rollout_minibatch.advantages * ratio,
+                rollout_minibatch.advantages
+                * torch.clamp(ratio, 1 - clip_coefficient, 1 + clip_coefficient),
+            ).mean()
+            vf_loss = F.mse_loss(values, rollout_minibatch.returns, reduction="mean")
+            loss = policy_loss + vf_coef * vf_loss + -entropy_coef * entropy
 
             optimizer.zero_grad()
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(
-                [*policy.parameters(), *V.parameters()], grad_clip_norm
-            )
+            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
             optimizer.step()
 
-            policy_losses.append(policy_loss.item())
-            vf_losses.append(vf_loss.item())
-            entropy_bonuses.append(entropy_bonus.item())
+            info["policy_loss"].append(policy_loss.item())
+            info["vf_loss"].append(vf_loss.item())
+            info["entropy"].append(entropy.item())
+            info["approx_kl"].append(approx_kl)
 
-            with torch.no_grad():
-                approx_kl = ((prob_ratio - 1) - logprob_ratio).mean()
-
-            if target_kl is not None and approx_kl > target_kl:
-                break
-
-    info = {
-        "policy": policy_loss.item(),
-        "vf": vf_loss.item(),
-        "entropy": entropy_bonus.item(),
-        "logvar": logvars_base.mean().item(),
-        "mean": means_base.mean().item(),
-    }
-
-    return (loss, info)
+    return info
 
 
-def do_episode(env, model, steps: int, deterministic=False):
+def run_rollout(
+    env: gym.Env,
+    model: ActorCritic,
+    steps: int,
+    deterministic: bool,
+    gamma: float,
+    lambda_: float,
+    normalize_advantages: bool,
+) -> Rollout:
     obs, info = env.reset()
-    done = False
-
     states = []
     actions = []
+    logprobs = []
     rewards = []
+    value_estimates = []
     dones = []
+    infos = []
 
     for _ in range(steps):
-        mean, logvar = model(obs)
-        if deterministic:
-            action = mean
-        else:
-            action = torch.randn(mean.shape).to(device) * torch.exp(logvar / 2) + mean
+        frame = model.sample_action(obs, deterministic)
 
         states.append(obs)
-        actions.append(action)
+        actions.append(frame.actions)
+        logprobs.append(frame.logprobs)
+        value_estimates.append(frame.values)
 
-        obs, reward, terminated, truncated, info = env.step(action)
+        obs, reward, terminated, truncated, info = env.step(frame.actions)
+
         rewards.append(reward)
-
         dones.append(terminated | truncated)
-    
-    # Add terminal state.
+        infos.append(info)
+
+    # Add final state.
     states.append(obs)
 
     states = torch.stack(states).float().detach()
     actions = torch.stack(actions).float().detach()
     rewards = torch.stack(rewards).float().detach()
+    logprobs = torch.stack(logprobs).float().detach()
     dones = torch.stack(dones).float().detach()
+    value_estimates = torch.stack(value_estimates).float().detach()
 
-    return (states, actions, rewards, truncated, dones)
+    return Rollout.from_raw_states(
+        states,
+        actions,
+        rewards,
+        logprobs,
+        dones,
+        value_estimates,
+        infos,
+        gamma,
+        lambda_,
+        normalize_advantages,
+    )
 
 
 def run_training():
-    import random
-
-    import numpy as np
-    import torch
-
     torch.manual_seed(0)
     np.random.seed(0)
     random.seed(0)
+
+    ENV = "PickCube-v0"
+    NUM_ENVS = 512
+    EPISODE_STEPS = 50
+    EPOCHS = 10000
+    CHECKPOINT_EVERY = 25
+    PPO_ITERATIONS = 4
+    VF_COEFFICIENT = 0.5
+    CLIP_COEFFICIENT = 0.2
+    ENTROPY_COEFFICIENT = 0.0
+    GRADIENT_CLIPPING_NORM = 1.0
+    NORMALIZE_ADVANTAGES = True
+    MINIBATCH_SIZE = 800
+    GAMMA = 0.8
+    LAMBDA = 0.9
+    TARGET_KL = 0.1
+
     env = gym.make(
         ENV,
         render_mode="rgb_array",
@@ -256,32 +350,15 @@ def run_training():
         num_envs=NUM_ENVS,
     )
     env = ManiSkillVectorEnv(
-        env,
+        env,  # type: ignore
         auto_reset=False,
         ignore_terminations=True,
     )
-
-    policy = Policy().to(device)
-    policy_ref = Policy().to(device)
-    policy_ref.load_state_dict(policy_ref.state_dict())
-    V = ValueNetwork().to(device)
-    V_targ = ValueNetwork().to(device)
-    V_targ.load_state_dict(V.state_dict())
-    optimizer = torch.optim.Adam([*policy.parameters(), *V.parameters()], lr=3e-4, weight_decay=1e-5)
-
-    EPISODE_STEPS = 50
-    epochs = 10000
-    ckpt_every = 25
-    ppo_update_iterations = 4
-    vf_sync_every = 5
-    epsilon = 0.2
-    entropy_bonus = 0.0
-    grad_clip_norm = 1.0
-    # gamma = 0.98
-    gamma = 0.8
-    lambda_ = 0.9
-    target_kl = 0.1
-    # lambda_ = 0.96
+    model = ActorCritic(
+        env.single_observation_space.shape[0],  # type: ignore
+        env.single_action_space.shape[0],  # type: ignore
+    )
+    optimizer = torch.optim.adam.Adam(model.parameters(), lr=3e-4, weight_decay=1e-5)
 
     out_dir = 0
     while os.path.exists("runs/" + str(out_dir)):
@@ -296,95 +373,64 @@ def run_training():
             "num_envs": NUM_ENVS,
             "ppo_update_iterations": 10,
             "vf_sync_every": 5,
-            "entropy_bonus": entropy_bonus,
-            "epsilon": epsilon,
-            "gamma": gamma,
-            "lambda": lambda_,
-            "grad_clip_norm": grad_clip_norm,
+            "entropy_bonus": ENTROPY_COEFFICIENT,
+            "epsilon": CLIP_COEFFICIENT,
+            "gamma": GAMMA,
+            "lambda": LAMBDA,
+            "grad_clip_norm": GRADIENT_CLIPPING_NORM,
         },
     )
 
-    with tqdm.tqdm(total=epochs) as pbar:
-        for epoch in range(epochs):
-            policy_ref.load_state_dict(policy.state_dict())
-            if (epoch + 1 % vf_sync_every) == 0:
-                V_targ.load_state_dict(V.state_dict())
-            # batched content.
-            states, actions, rewards, truncated, dones = do_episode(env, policy, steps=EPISODE_STEPS)
-            # log current reward.
-            total_reward = rewards.sum(0).mean()
+    log_step = 0
+
+    with tqdm.tqdm(total=EPOCHS) as pbar:
+        for epoch in range(EPOCHS):
+            rollout = run_rollout(
+                env,
+                model,
+                steps=EPISODE_STEPS,
+                deterministic=False,
+                gamma=GAMMA,
+                lambda_=LAMBDA,
+                normalize_advantages=NORMALIZE_ADVANTAGES,
+            )
+            train_returns = rollout.returns[0].mean().item()
+            train_rewards = rollout.rewards.sum(0).mean().item()
 
             # Run a pass over the data.
-            loss, info = ppo_update(
+            info = ppo_update(
                 optimizer,
-                policy,
-                policy_ref,
-                V,
-                V_targ,
-                states,
-                actions,
-                rewards,
-                dones,
-                epsilon=epsilon,
-                entropy_coef=entropy_bonus,
-                gamma=gamma,
-                lambda_=lambda_,
-                num_iterations=ppo_update_iterations,
-                grad_clip_norm=grad_clip_norm,
-                target_kl=target_kl,
+                model,
+                rollout,
+                clip_coefficient=CLIP_COEFFICIENT,
+                vf_coef=VF_COEFFICIENT,
+                entropy_coef=ENTROPY_COEFFICIENT,
+                grad_clip_norm=GRADIENT_CLIPPING_NORM,
+                target_kl=TARGET_KL,
+                num_iterations=PPO_ITERATIONS,
+                minibatch_size=MINIBATCH_SIZE,
             )
-
-            pbar.set_postfix({**info, "reward": total_reward.item()})
-            pbar.update()
-            with open(f"runs/{out_dir}/reward.jsonl", "a") as f:
-                f.write(
-                    json.dumps({"epoch": epoch, **info, "reward": total_reward.item()})
-                    + "\n"
-                )
 
             wandb.log(
-                {**info, "reward": total_reward.item()},
-                step=epoch,
+                {"train/returns": train_returns, "train/rewards": train_rewards},
+                log_step,
             )
+            for i in range(len(info["policy_loss"])):
+                wandb.log(info, log_step)
 
-            if (epoch + 1) % ckpt_every == 0:
-                torch.save(policy.state_dict(), f"runs/{out_dir}/ckpt_{epoch + 1}.pt")
+                log_step += 1
 
-            if (epoch + 1) % ckpt_every == 0:
-                torch.save(V.state_dict(), f"runs/{out_dir}/ckpt_{epoch + 1}_vf.pt")
+            pbar.update()
 
-
-def eval():
-    env = gym.make(
-        ENV,
-        render_mode="rgb_array",
-        sim_backend="gpu",
-        control_mode="pd_joint_delta_pos",
-        obs_mode="state",
-        num_envs=1,
-    )
-    print(env.action_space)
-    env = RecordEpisode(env, output_dir="Videos", save_trajectory=False, save_video=True, video_fps=30, max_steps_per_video=100)
-    policy = Policy().to(device)
-    policy.load_state_dict(torch.load("runs/44/ckpt_7200.pt", weights_only=True))
-
-    success = 0
-    for i in range(100):
-        states, actions, rewards, truncated = do_episode(
-            env, policy, deterministic=True
-        )
-        print(actions)
-        success += (~truncated).sum().item()
-        print((~truncated).sum().item(), rewards.sum().item())
-
-    print(success / 100)
+            if (epoch + 1) % CHECKPOINT_EVERY == 0:
+                torch.save(model.state_dict(), f"runs/{out_dir}/ckpt_{epoch + 1}.pt")
 
 
 if __name__ == "__main__":
     if sys.argv[1] == "train":
         run_training()
-    else:
-        eval()
+    # else:
+    #     eval()
 # policy = Policy()
 # mean, logvar = policy(torch.zeros((1, 42)))
 # print(mean)
