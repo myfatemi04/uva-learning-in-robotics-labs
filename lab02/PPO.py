@@ -140,7 +140,7 @@ def compute_logprobs(
 
 def compute_entropy(logstds: torch.Tensor):
     # E_p[log(Gaussian(µ, σ, x))] = 1/2*log(2πσ^2) + 1/2 = 1/2 * log(2π) + log(σ) + 1/2
-    return 0.5 * (1 + math.log(2 * math.pi)) + logstds.mean()
+    return 0.5 * (1 + math.log(2 * math.pi)) + logstds.sum(dim=-1).mean()
 
 
 def layer_init(layer: nn.Linear, std=np.sqrt(2), bias_const=0.0):
@@ -159,6 +159,8 @@ def make_base(sizes):
 
 class ActorCritic(nn.Module):
     def __init__(self, state_dim: int, action_dim: int):
+        super().__init__()
+
         self.actor_base = make_base([state_dim, 256, 256, 256])
         self.critic_base = make_base([state_dim, 256, 256, 256])
         self.mean_head = nn.Linear(256, action_dim)
@@ -194,6 +196,9 @@ class ActorCritic(nn.Module):
             actions,
         )
 
+    def value(self, states: torch.Tensor) -> torch.Tensor:
+        return self(states)[2]
+
     def value_logprob_entropy(
         self, states: torch.Tensor, actions: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -204,7 +209,7 @@ class ActorCritic(nn.Module):
 
 
 def ppo_update(
-    optimizer: torch.optim.optimizer.Optimizer,
+    optimizer: torch.optim.Optimizer,  # type: ignore
     model: ActorCritic,
     rollout: Rollout,
     clip_coefficient: float,
@@ -217,7 +222,7 @@ def ppo_update(
 ) -> dict:
     rollout_flat = rollout.flatten()
 
-    info = {
+    losses = {
         "policy_loss": [],
         "vf_loss": [],
         "entropy": [],
@@ -256,12 +261,12 @@ def ppo_update(
             torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
             optimizer.step()
 
-            info["policy_loss"].append(policy_loss.item())
-            info["vf_loss"].append(vf_loss.item())
-            info["entropy"].append(entropy.item())
-            info["approx_kl"].append(approx_kl)
+            losses["policy_loss"].append(policy_loss.item())
+            losses["vf_loss"].append(vf_loss.item())
+            losses["entropy"].append(entropy.item())
+            losses["approx_kl"].append(approx_kl)
 
-    return info
+    return losses
 
 
 def run_rollout(
@@ -298,6 +303,8 @@ def run_rollout(
 
     # Add final state.
     states.append(obs)
+    # Add final value.
+    value_estimates.append(model.value(obs))
 
     states = torch.stack(states).float().detach()
     actions = torch.stack(actions).float().detach()
@@ -325,7 +332,7 @@ def run_training():
     np.random.seed(0)
     random.seed(0)
 
-    ENV = "PickCube-v0"
+    ENV = "PickCube-v1"
     NUM_ENVS = 512
     EPISODE_STEPS = 50
     EPOCHS = 10000
@@ -353,12 +360,13 @@ def run_training():
         env,  # type: ignore
         auto_reset=False,
         ignore_terminations=True,
+        record_metrics=True,
     )
     model = ActorCritic(
         env.single_observation_space.shape[0],  # type: ignore
         env.single_action_space.shape[0],  # type: ignore
-    )
-    optimizer = torch.optim.adam.Adam(model.parameters(), lr=3e-4, weight_decay=1e-5)
+    ).to(device)
+    optimizer = torch.optim.Adam(model.parameters(), lr=3e-4, weight_decay=1e-5)  # type: ignore
 
     out_dir = 0
     while os.path.exists("runs/" + str(out_dir)):
@@ -371,17 +379,23 @@ def run_training():
         config={
             "environment": ENV,
             "num_envs": NUM_ENVS,
-            "ppo_update_iterations": 10,
-            "vf_sync_every": 5,
-            "entropy_bonus": ENTROPY_COEFFICIENT,
-            "epsilon": CLIP_COEFFICIENT,
+            "episode_steps": EPISODE_STEPS,
+            "epochs": EPOCHS,
+            "checkpoint_every": CHECKPOINT_EVERY,
+            "ppo_iterations": PPO_ITERATIONS,
+            "vf_coefficient": VF_COEFFICIENT,
+            "clip_coefficient": CLIP_COEFFICIENT,
+            "entropy_coefficient": ENTROPY_COEFFICIENT,
+            "gradient_clipping_norm": GRADIENT_CLIPPING_NORM,
+            "normalize_advantages": NORMALIZE_ADVANTAGES,
+            "minibatch_size": MINIBATCH_SIZE,
             "gamma": GAMMA,
             "lambda": LAMBDA,
-            "grad_clip_norm": GRADIENT_CLIPPING_NORM,
+            "target_kl": TARGET_KL,
         },
     )
 
-    log_step = 0
+    global_step = 0
 
     with tqdm.tqdm(total=EPOCHS) as pbar:
         for epoch in range(EPOCHS):
@@ -394,11 +408,22 @@ def run_training():
                 lambda_=LAMBDA,
                 normalize_advantages=NORMALIZE_ADVANTAGES,
             )
-            train_returns = rollout.returns[0].mean().item()
+            train_returns = rollout.returns.sum(0).mean().item()
             train_rewards = rollout.rewards.sum(0).mean().item()
+            for info in rollout.infos:
+                global_step += NUM_ENVS
+                if "final_info" in info:
+                    done_mask = info["_final_info"]
+                    wandb.log(
+                        {
+                            "train/" + k: v[done_mask].mean()
+                            for (k, v) in info["final_info"].items()
+                        },
+                        global_step,
+                    )
 
             # Run a pass over the data.
-            info = ppo_update(
+            losses = ppo_update(
                 optimizer,
                 model,
                 rollout,
@@ -412,14 +437,12 @@ def run_training():
             )
 
             wandb.log(
-                {"train/returns": train_returns, "train/rewards": train_rewards},
-                log_step,
+                {"losses/" + k: losses[k][-1] for k in losses.keys()}, global_step
             )
-            for i in range(len(info["policy_loss"])):
-                wandb.log(info, log_step)
 
-                log_step += 1
-
+            pbar.set_postfix(
+                {"train/returns": train_returns, "train/rewards": train_rewards}
+            )
             pbar.update()
 
             if (epoch + 1) % CHECKPOINT_EVERY == 0:
