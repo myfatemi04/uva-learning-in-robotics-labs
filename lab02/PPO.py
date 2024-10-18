@@ -72,7 +72,7 @@ class Rollout:
 
             # If action t received a "done" signal, then future rewards should not percolate beyond
             # episode boundaries.
-            gae = gamma * lambda_ * gae * (1.0 - dones[t]) + delta
+            gae = gamma * lambda_ * gae * (~dones[t]) + delta
             advantages[t] = gae
 
         returns = advantages + value_estimates
@@ -310,7 +310,7 @@ def run_rollout(
     actions = torch.stack(actions).float().detach()
     rewards = torch.stack(rewards).float().detach()
     logprobs = torch.stack(logprobs).float().detach()
-    dones = torch.stack(dones).float().detach()
+    dones = torch.stack(dones).bool().detach()
     value_estimates = torch.stack(value_estimates).float().detach()
 
     return Rollout.from_raw_states(
@@ -410,14 +410,13 @@ def run_training():
             )
             train_returns = rollout.returns.sum(0).mean().item()
             train_rewards = rollout.rewards.sum(0).mean().item()
-            for info in rollout.infos:
+            for done_mask, info in zip(rollout.dones, rollout.infos):
                 global_step += NUM_ENVS
-                if "final_info" in info:
-                    done_mask = info["_final_info"]
+                if done_mask.any():
                     wandb.log(
                         {
-                            "train/" + k: v[done_mask].mean()
-                            for (k, v) in info["final_info"].items()
+                            "train/" + k: v[done_mask].float().mean()
+                            for (k, v) in info["episode"].items()
                         },
                         global_step,
                     )
@@ -449,13 +448,73 @@ def run_training():
                 torch.save(model.state_dict(), f"runs/{out_dir}/ckpt_{epoch + 1}.pt")
 
 
+def eval():
+    torch.manual_seed(0)
+    np.random.seed(0)
+    random.seed(0)
+
+    ENV = "PickCube-v1"
+    NUM_ENVS = 100
+    DO_RECORDING = False
+    # NUM_ENVS = 1
+    # DO_RECORDING = True
+
+    assert not DO_RECORDING or NUM_ENVS == 1, "NUM_ENVS must be 1 if recording."
+
+    env = gym.make(
+        ENV,
+        render_mode="rgb_array",
+        sim_backend="gpu",
+        control_mode="pd_joint_delta_pos",
+        obs_mode="state",
+        num_envs=NUM_ENVS,
+    )
+    if DO_RECORDING:
+        env = RecordEpisode(
+            env,  # type: ignore
+            output_dir="Videos_test",
+            save_trajectory=False,
+            video_fps=30,
+        )
+    env = ManiSkillVectorEnv(
+        env,  # type: ignore
+        auto_reset=False,
+        ignore_terminations=True,
+        record_metrics=True,
+    )
+    model = ActorCritic(
+        env.single_observation_space.shape[0],  # type: ignore
+        env.single_action_space.shape[0],  # type: ignore
+    ).to(device)
+    model.load_state_dict(torch.load("runs/77/ckpt_125.pt", weights_only=True))
+
+    rollout = run_rollout(
+        env,
+        model,
+        steps=50,
+        deterministic=True,
+        gamma=0,
+        lambda_=0,
+        normalize_advantages=False,
+    )
+    stats = {}
+    for done_mask, info in zip(rollout.dones, rollout.infos):
+        if done_mask.any():
+            for k, v in info["episode"].items():
+                if k not in stats:
+                    stats[k] = []
+
+                stats[k].extend(v[done_mask].detach().cpu().tolist())
+
+    for k in stats.keys():
+        print(f"{k}: {sum(stats[k]) / len(stats[k]):.3f} ({NUM_ENVS} trials)")
+
+
 if __name__ == "__main__":
-    if sys.argv[1] == "train":
-        run_training()
-    # else:
-    #     eval()
-# policy = Policy()
-# mean, logvar = policy(torch.zeros((1, 42)))
-# print(mean)
-# logvar.sum().backward()
-# print(policy.logvar.grad)
+    match sys.argv[1]:
+        case "train":
+            run_training()
+        case "eval":
+            eval()
+        case _:
+            raise ValueError("Invalid argument")
