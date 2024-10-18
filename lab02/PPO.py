@@ -3,6 +3,7 @@ import os
 import random
 import sys
 from dataclasses import dataclass
+from typing import Optional
 
 import gymnasium as gym
 import numpy as np
@@ -157,55 +158,47 @@ def make_base(sizes):
     return nn.Sequential(*modules)
 
 
+def make_critic(state_dim):
+    return make_base([state_dim, 256, 256, 256, 1])
+
+
 class ActorCritic(nn.Module):
     def __init__(self, state_dim: int, action_dim: int):
         super().__init__()
 
         self.actor_base = make_base([state_dim, 256, 256, 256])
-        self.critic_base = make_base([state_dim, 256, 256, 256])
         self.mean_head = nn.Linear(256, action_dim)
         self.logstd = nn.Parameter(
             -1 / 2 * torch.ones(1, action_dim), requires_grad=True
         )
-        self.value_head = nn.Linear(256, 1)
+        self.critic = make_critic(state_dim)
+        self.critic_target = make_critic(state_dim)
+        self.critic_target.load_state_dict(self.critic.state_dict())
+        self.critic_target.requires_grad_(False)
 
-    def forward(
-        self, states: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def synchronize_critics(self):
+        self.critic_target.load_state_dict(self.critic.state_dict())
+
+    def actor(self, states: torch.Tensor):
         x_actor = self.actor_base(states)
-        x_critic = self.critic_base(states)
-
         mean = F.tanh(self.mean_head(x_actor))
         logstd = self.logstd.expand_as(mean)
-        value = self.value_head(x_critic).squeeze(-1)
+        return mean, logstd
 
-        return mean, logstd, value
-
-    def sample_action(self, states: torch.Tensor, deterministic: bool) -> ActionStep:
-        means, logstds, values = self(states)
+    def sample_action(self, states: torch.Tensor, deterministic: bool):
+        means, logstds = self.actor(states)
         actions = means + (
             torch.randn_like(means) * torch.exp(logstds / 2) if not deterministic else 0
         )
         logprobs = compute_logprobs(means, logstds, actions)
 
-        return ActionStep(
-            means,
-            logstds,
-            logprobs,
-            values,
-            actions,
-        )
+        return (actions, logprobs)
 
     def value(self, states: torch.Tensor) -> torch.Tensor:
-        return self(states)[2]
+        return self.critic(states).squeeze(-1)
 
-    def value_logprob_entropy(
-        self, states: torch.Tensor, actions: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        means, logstds, values = self(states)
-        logprobs = compute_logprobs(means, logstds, actions)
-        entropy = compute_entropy(logstds)
-        return values, logprobs, entropy
+    def value_target(self, states: torch.Tensor) -> torch.Tensor:
+        return self.critic_target(states).squeeze(-1)
 
 
 def ppo_update(
@@ -236,9 +229,11 @@ def ppo_update(
             minibatch_indices = indices[i : i + minibatch_size]
             rollout_minibatch = rollout_flat[minibatch_indices]
 
-            values, logprobs, entropy = model.value_logprob_entropy(
-                rollout_minibatch.states, rollout_minibatch.actions
-            )
+            values = model.value(rollout_minibatch.states)
+            means, logstds = model.actor(rollout_minibatch.states)
+            logprobs = compute_logprobs(means, logstds, rollout_minibatch.actions)
+            entropy = compute_entropy(logstds)
+
             log_ratio = logprobs - rollout_minibatch.logprobs
             ratio = torch.exp(log_ratio)
 
@@ -269,6 +264,7 @@ def ppo_update(
     return losses
 
 
+@torch.no_grad()
 def run_rollout(
     env: gym.Env,
     model: ActorCritic,
@@ -288,14 +284,15 @@ def run_rollout(
     infos = []
 
     for _ in range(steps):
-        frame = model.sample_action(obs, deterministic)
+        (actions_, logprobs_) = model.sample_action(obs, deterministic)
+        values = model.value_target(obs)
 
         states.append(obs)
-        actions.append(frame.actions)
-        logprobs.append(frame.logprobs)
-        value_estimates.append(frame.values)
+        actions.append(actions_)
+        logprobs.append(logprobs_)
+        value_estimates.append(values)
 
-        obs, reward, terminated, truncated, info = env.step(frame.actions)
+        obs, reward, terminated, truncated, info = env.step(actions)
 
         rewards.append(reward)
         dones.append(terminated | truncated)
@@ -304,7 +301,7 @@ def run_rollout(
     # Add final state.
     states.append(obs)
     # Add final value.
-    value_estimates.append(model.value(obs))
+    value_estimates.append(model.value_target(obs))
 
     states = torch.stack(states).float().detach()
     actions = torch.stack(actions).float().detach()
@@ -328,17 +325,15 @@ def run_rollout(
 
 
 def run_training():
-    torch.manual_seed(0)
-    np.random.seed(0)
-    random.seed(0)
-
     ENV = "PickCube-v1"
+    SEED = 1
     NUM_ENVS = 512
     EPISODE_STEPS = 50
     EPOCHS = 10000
     CHECKPOINT_EVERY = 25
     PPO_ITERATIONS = 4
     VF_COEFFICIENT = 0.5
+    VF_SYNCHRONIZE_EVERY = 4
     CLIP_COEFFICIENT = 0.2
     ENTROPY_COEFFICIENT = 0.0
     GRADIENT_CLIPPING_NORM = 1.0
@@ -347,6 +342,10 @@ def run_training():
     GAMMA = 0.8
     LAMBDA = 0.9
     TARGET_KL = 0.1
+
+    torch.manual_seed(SEED)
+    np.random.seed(SEED)
+    random.seed(SEED)
 
     env = gym.make(
         ENV,
@@ -362,11 +361,10 @@ def run_training():
         ignore_terminations=True,
         record_metrics=True,
     )
-    model = ActorCritic(
-        env.single_observation_space.shape[0],  # type: ignore
-        env.single_action_space.shape[0],  # type: ignore
-    ).to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=3e-4, weight_decay=1e-5)  # type: ignore
+    state_dim: int = env.single_observation_space.shape[0]  # type: ignore
+    action_dim: int = env.single_action_space.shape[0]  # type: ignore
+    model = ActorCritic(state_dim, action_dim).to(device)
+    optimizer = torch.optim.Adam(model.parameters(), lr=3e-4, eps=1e-6)  # type: ignore
 
     out_dir = 0
     while os.path.exists("runs/" + str(out_dir)):
@@ -384,6 +382,7 @@ def run_training():
             "checkpoint_every": CHECKPOINT_EVERY,
             "ppo_iterations": PPO_ITERATIONS,
             "vf_coefficient": VF_COEFFICIENT,
+            "vf_synchronize_every": VF_SYNCHRONIZE_EVERY,
             "clip_coefficient": CLIP_COEFFICIENT,
             "entropy_coefficient": ENTROPY_COEFFICIENT,
             "gradient_clipping_norm": GRADIENT_CLIPPING_NORM,
@@ -422,6 +421,8 @@ def run_training():
                     )
 
             # Run a pass over the data.
+            if (epoch + 1) % VF_SYNCHRONIZE_EVERY == 0:
+                model.synchronize_critics()
             losses = ppo_update(
                 optimizer,
                 model,
