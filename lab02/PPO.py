@@ -20,13 +20,13 @@ if torch.cuda.is_available():
 else:
     device = "cpu"
 
-NUM_ENVS = 128
-ENV = "OpenCabinetDrawer-v1"
-STATE_DIM = 44
-ACTION_DIM = 13
-# ENV = "PickCube-v1"
-# STATE_DIM = 42
-# ACTION_DIM = 8
+NUM_ENVS = 512
+# ENV = "OpenCabinetDrawer-v1"
+# STATE_DIM = 44
+# ACTION_DIM = 13
+ENV = "PickCube-v1"
+STATE_DIM = 42
+ACTION_DIM = 8
 
 def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
     torch.nn.init.orthogonal_(layer.weight, std)
@@ -45,8 +45,8 @@ class Policy(nn.Module):
     def __init__(self, state_dim=STATE_DIM, act_dim=ACTION_DIM):
         super().__init__()
 
-        self.base = make_base([state_dim, 256, 256, 256, 64])
-        self.mean_head = nn.Linear(64, act_dim)
+        self.base = make_base([state_dim, 256, 256, 256])
+        self.mean_head = nn.Linear(256, act_dim)
         # self.logvar_head = nn.Linear(64, act_dim)
         self.logvar = nn.Parameter(-torch.ones(1, act_dim), requires_grad=True)
 
@@ -63,8 +63,8 @@ class ValueNetwork(nn.Module):
     def __init__(self, state_dim=STATE_DIM):
         super().__init__()
 
-        self.base = make_base([state_dim, 256, 256, 256, 64])
-        self.value_head = nn.Linear(64, 1)
+        self.base = make_base([state_dim, 256, 256, 256])
+        self.value_head = nn.Linear(256, 1)
 
     def forward(self, states: torch.Tensor):
         x = self.base(states)
@@ -80,20 +80,20 @@ def logprobs(means, logvars, actions):
     ).sum(axis=-1)
 
 
-def reward_estimation(V, states, rewards, gamma, lambda_):
+def reward_estimation(V, states, rewards, dones, gamma, lambda_):
     gae_estimate = torch.zeros(states.shape[:-1], device=device)
     values = V(states)
     gae = 0
 
-    seqlen = states.shape[-2]
+    seqlen = states.shape[0] - 1
     for t in reversed(range(seqlen)):
         delta = (
-            rewards[..., t]
-            + (gamma * values[..., t + 1] if t + 1 < seqlen else 0)
-            - values[..., t]
+            rewards[t]
+            + (gamma * values[t + 1] if t + 1 < seqlen else 0)
+            - values[t]
         )
-        gae = gamma * lambda_ * gae + delta
-        gae_estimate[..., t] = gae
+        gae = gamma * lambda_ * gae * (1.0 - dones[t + 1]) + delta
+        gae_estimate[t] = gae
 
     # returns and advantages
     return gae_estimate + values, gae_estimate
@@ -108,20 +108,22 @@ def ppo_update(
     states,
     actions,
     rewards,
+    dones,
     epsilon=0.1,
     vf_coef=1.0,
     entropy_coef=0.1,
     gamma=0.98,
     lambda_=0.96,
     grad_clip_norm=1.0,
+    target_kl=0.1,
     normalize_advantages=True,
-    num_iterations=10,
-    minibatch_size=64,
+    num_iterations=4,
+    minibatch_size=800,
 ):
     states = states[:-1]
     with torch.no_grad():
-        value_estimate, advantage_estimate = reward_estimation(
-            V_targ, states, rewards, gamma, lambda_
+        return_estimate, advantage_estimate = reward_estimation(
+            V_targ, states, rewards, dones, gamma, lambda_
         )
         logprobs_ref = logprobs(*policy_ref(states), actions)
 
@@ -132,7 +134,7 @@ def ppo_update(
 
     # flatten.
     states_flat = states.reshape((-1, states.shape[-1]))
-    value_estimates_flat = value_estimate.reshape((-1,))
+    return_estimates_flat = return_estimate.reshape((-1,))
     advantage_estimates_flat = advantage_estimate.reshape((-1,))
     logprobs_ref_flat = logprobs_ref.reshape((-1,))
     actions_flat = actions.reshape((-1, actions.shape[-1]))
@@ -143,43 +145,52 @@ def ppo_update(
     entropy_bonuses = []
 
     for iter_ in range(num_iterations):
-        indices = np.random.shuffle(indices)
+        np.random.shuffle(indices)
 
         for i in range(0, len(indices), minibatch_size):
             minibatch_indices = indices[i:i + minibatch_size]
 
-        means_base, logvars_base_ = policy(states_flat[minibatch_indices])
-        logvars_base = torch.max(torch.tensor(-8.0, device=device), logvars_base_)
-        logprobs_base = logprobs(means_base, logvars_base, actions_flat[minibatch_indices])
-        logprob_ratio = logprobs_base - logprobs_ref_flat[minibatch_indices]
-        prob_ratio = torch.exp(logprob_ratio)
+            means_base, logvars_base = policy(states_flat[minibatch_indices])
+            # logvars_base = torch.max(torch.tensor(-8.0, device=device), logvars_base_)
+            logprobs_base = logprobs(means_base, logvars_base, actions_flat[minibatch_indices])
+            logprob_ratio = logprobs_base - logprobs_ref_flat[minibatch_indices]
+            prob_ratio = torch.exp(logprob_ratio)
 
-        policy_loss = -torch.min(
-            advantage_estimates_flat[minibatch_indices] * prob_ratio,
-            advantage_estimates_flat[minibatch_indices] * torch.clamp(prob_ratio, 1 - epsilon, 1 + epsilon),
-        )
-        policy_loss = policy_loss.mean()
+            policy_loss = -torch.min(
+                advantage_estimates_flat[minibatch_indices] * prob_ratio,
+                advantage_estimates_flat[minibatch_indices] * torch.clamp(prob_ratio, 1 - epsilon, 1 + epsilon),
+            )
+            policy_loss = policy_loss.mean()
 
-        vf_loss = F.mse_loss(V(states).squeeze(-1), value_estimates_flat[minibatch_indices])
+            vf_loss = F.mse_loss(
+                V(states_flat[minibatch_indices]),
+                return_estimates_flat[minibatch_indices],
+            )
 
-        # E_p[log(Gaussian(µ, σ, x))] = 1/2*log(2πσ^2) + 1/2 = 1/2 * log(2π) + log(σ) + 1/2
-        # We only really care about the log(σ) part though, which is equal to log(var) up to a constant factor of 2.
-        entropy_bonus = logvars_base.sum(dim=-1).mean() + 1 / 2 * (
-            1 + math.log(2 * np.pi)
-        )
+            # E_p[log(Gaussian(µ, σ, x))] = 1/2*log(2πσ^2) + 1/2 = 1/2 * log(2π) + log(σ) + 1/2
+            # We only really care about the log(σ) part though, which is equal to log(var) up to a constant factor of 2.
+            entropy_bonus = logvars_base.sum(dim=-1).mean() + 1 / 2 * (
+                1 + math.log(2 * np.pi)
+            )
 
-        loss = policy_loss + vf_coef * vf_loss + -entropy_coef * entropy_bonus
+            loss = policy_loss + vf_coef * vf_loss + -entropy_coef * entropy_bonus
 
-        optimizer.zero_grad()
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(
-            [*policy.parameters(), *V.parameters()], grad_clip_norm
-        )
-        optimizer.step()
+            optimizer.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(
+                [*policy.parameters(), *V.parameters()], grad_clip_norm
+            )
+            optimizer.step()
 
-        policy_losses.append(policy_loss.item())
-        vf_losses.append(vf_loss.item())
-        entropy_bonuses.append(entropy_bonus.item())
+            policy_losses.append(policy_loss.item())
+            vf_losses.append(vf_loss.item())
+            entropy_bonuses.append(entropy_bonus.item())
+
+            with torch.no_grad():
+                approx_kl = ((prob_ratio - 1) - logprob_ratio).mean()
+
+            if target_kl is not None and approx_kl > target_kl:
+                break
 
     info = {
         "policy": policy_loss.item(),
@@ -192,17 +203,16 @@ def ppo_update(
     return (loss, info)
 
 
-# Observation space is 51 dims.
-# Action space is [-1, 1]^9.
-def do_episode(env, model, deterministic=False):
+def do_episode(env, model, steps: int, deterministic=False):
     obs, info = env.reset()
     done = False
 
     states = []
     actions = []
     rewards = []
+    dones = []
 
-    while not done:
+    for _ in range(steps):
         mean, logvar = model(obs)
         if deterministic:
             action = mean
@@ -215,16 +225,17 @@ def do_episode(env, model, deterministic=False):
         obs, reward, terminated, truncated, info = env.step(action)
         rewards.append(reward)
 
-        done = terminated.any() or truncated.any()
-
+        dones.append(terminated | truncated)
+    
     # Add terminal state.
     states.append(obs)
 
     states = torch.stack(states).float().detach()
     actions = torch.stack(actions).float().detach()
     rewards = torch.stack(rewards).float().detach()
+    dones = torch.stack(dones).float().detach()
 
-    return (states, actions, rewards, truncated)
+    return (states, actions, rewards, truncated, dones)
 
 
 def run_training():
@@ -247,7 +258,7 @@ def run_training():
     env = ManiSkillVectorEnv(
         env,
         auto_reset=False,
-        ignore_terminations=False,
+        ignore_terminations=True,
     )
 
     policy = Policy().to(device)
@@ -256,17 +267,21 @@ def run_training():
     V = ValueNetwork().to(device)
     V_targ = ValueNetwork().to(device)
     V_targ.load_state_dict(V.state_dict())
-    optimizer = torch.optim.Adam([*policy.parameters(), *V.parameters()], lr=1e-4)
+    optimizer = torch.optim.Adam([*policy.parameters(), *V.parameters()], lr=3e-4, weight_decay=1e-5)
 
+    EPISODE_STEPS = 50
     epochs = 10000
     ckpt_every = 25
     ppo_update_iterations = 4
     vf_sync_every = 5
     epsilon = 0.2
-    entropy_bonus = 0.1
+    entropy_bonus = 0.0
     grad_clip_norm = 1.0
-    gamma = 0.98
-    lambda_ = 0.96
+    # gamma = 0.98
+    gamma = 0.8
+    lambda_ = 0.9
+    target_kl = 0.1
+    # lambda_ = 0.96
 
     out_dir = 0
     while os.path.exists("runs/" + str(out_dir)):
@@ -295,7 +310,7 @@ def run_training():
             if (epoch + 1 % vf_sync_every) == 0:
                 V_targ.load_state_dict(V.state_dict())
             # batched content.
-            states, actions, rewards, truncated = do_episode(env, policy)
+            states, actions, rewards, truncated, dones = do_episode(env, policy, steps=EPISODE_STEPS)
             # log current reward.
             total_reward = rewards.sum(0).mean()
 
@@ -309,12 +324,14 @@ def run_training():
                 states,
                 actions,
                 rewards,
+                dones,
                 epsilon=epsilon,
                 entropy_coef=entropy_bonus,
                 gamma=gamma,
                 lambda_=lambda_,
                 num_iterations=ppo_update_iterations,
                 grad_clip_norm=grad_clip_norm,
+                target_kl=target_kl,
             )
 
             pbar.set_postfix({**info, "reward": total_reward.item()})
