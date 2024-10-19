@@ -1,8 +1,8 @@
 import os
 import random
 import sys
-from dataclasses import dataclass
 import time
+from dataclasses import dataclass
 
 import gymnasium as gym
 import numpy as np
@@ -78,54 +78,20 @@ class Rollout:
         gae = 0
         seqlen = actions.shape[0]
 
-        if not finite_horizon_gae:
-            for t in reversed(range(seqlen)):
-                delta = (
-                    rewards[t] + gamma * next_value_estimates[t] - value_estimates[t]
-                )
+        if finite_horizon_gae:
+            raise NotImplementedError("Finite horizon GAE has been removed.")
 
-                # If action t received a "done" signal, then future rewards should not percolate beyond
-                # episode boundaries.
-                gae = gamma * lambda_ * gae * (~dones[t]) + delta
-                advantages[t] = gae
-        else:
-            lambda_coefficient_sum = 0
-            reward_term_sum = 0
-            value_term_sum = 0
-            for t in reversed(range(seqlen)):
-                # Reinitialize the sums for any environments which just terminated their episode.
-                lambda_coefficient_sum = lambda_coefficient_sum * (~dones[t])
-                reward_term_sum = reward_term_sum * (~dones[t])
-                value_term_sum = value_term_sum * (~dones[t])
+        for t in reversed(range(seqlen)):
+            delta = rewards[t] + gamma * next_value_estimates[t] - value_estimates[t]
 
-                # Sort of inductive.
-                # The r_t sum is gamma * r_{t + 1} sum + r_t times the current lambda coefficient sum.
-                # This is based on the implementation in the Maniskill baseline.
-                """
-                1             *(  -V(s_t)  + r_t                                                               + gamma * V(s_{t+1})   )
-                lambda        *(  -V(s_t)  + r_t + gamma * r_{t+1}                                             + gamma^2 * V(s_{t+2}) )
-                lambda^2      *(  -V(s_t)  + r_t + gamma * r_{t+1} + gamma^2 * r_{t+2}                         + ...                  )
-                lambda^3      *(  -V(s_t)  + r_t + gamma * r_{t+1} + gamma^2 * r_{t+2} + gamma^3 * r_{t+3}
-                """
-                lambda_coefficient_sum = 1 + lambda_ * lambda_coefficient_sum
-                reward_term_sum = (
-                    lambda_ * gamma * reward_term_sum
-                    + lambda_coefficient_sum * rewards[t]
-                )
-                value_term_sum = (
-                    lambda_ * gamma * value_term_sum + gamma * next_value_estimates[t]
-                )
-                advantages[t] = (
-                    reward_term_sum + value_term_sum
-                ) / lambda_coefficient_sum - value_estimates[t]
+            # If action t received a "done" signal, then future rewards should not percolate beyond
+            # episode boundaries.
+            gae = gamma * lambda_ * gae * (~dones[t]) + delta
+            advantages[t] = gae
 
         returns = advantages + value_estimates
         if normalize_advantages:
             advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
-
-        # print(
-        #     f"{states.shape=} {actions.shape=} {rewards.shape=} {logprobs.shape=} {dones.shape=} {value_estimates.shape=} {len(infos)=} {returns.shape=} {advantages.shape=}"
-        # )
 
         return Rollout(
             states,
@@ -194,12 +160,13 @@ def make_base(sizes):
     modules = []
     for i in range(len(sizes) - 1):
         modules.append(layer_init(nn.Linear(sizes[i], sizes[i + 1])))
-        modules.append(nn.Tanh())
+        if i < len(sizes) - 1:
+            modules.append(nn.Tanh())
     return nn.Sequential(*modules)
 
 
-def make_critic(state_dim):
-    return make_base([state_dim, 256, 256, 256, 1])
+# def make_critic(state_dim):
+#     return make_base([state_dim, 256, 256, 256, 1])
 
 
 class ActorCritic(nn.Module):
@@ -219,6 +186,17 @@ class ActorCritic(nn.Module):
             nn.Tanh(),
             layer_init(nn.Linear(256, 1)),
         )
+        self.critic_target = nn.Sequential(
+            layer_init(nn.Linear(state_dim, 256)),
+            nn.Tanh(),
+            layer_init(nn.Linear(256, 256)),
+            nn.Tanh(),
+            layer_init(nn.Linear(256, 256)),
+            nn.Tanh(),
+            layer_init(nn.Linear(256, 1)),
+        )
+        self.critic_target.load_state_dict(self.critic.state_dict())
+        self.critic_target.requires_grad_(False)
         self.actor_mean = nn.Sequential(
             layer_init(nn.Linear(state_dim, 256)),
             nn.Tanh(),
@@ -230,18 +208,14 @@ class ActorCritic(nn.Module):
         )
 
         self.logstd = nn.Parameter(-0.5 * torch.ones(1, action_dim), requires_grad=True)
-        self.critic = make_critic(state_dim)
-        # self.critic_target = make_critic(state_dim)
-        # self.critic_target.load_state_dict(self.critic.state_dict())
-        # self.critic_target.requires_grad_(False)
 
-    # def synchronize_critics(self, beta: float):
-    #     # Exponential moving average
-    #     with torch.no_grad():
-    #         for param, target_param in zip(
-    #             self.critic.parameters(), self.critic_target.parameters()
-    #         ):
-    #             target_param.data = beta * target_param.data + (1 - beta) * param.data
+    def synchronize_critics(self, beta: float):
+        # Exponential moving average
+        with torch.no_grad():
+            for param, target_param in zip(
+                self.critic.parameters(), self.critic_target.parameters()
+            ):
+                target_param.data = beta * target_param.data + (1 - beta) * param.data
 
     def actor(self, states: torch.Tensor):
         # x_actor = self.actor_base(states)
@@ -323,15 +297,6 @@ def ppo_update(
             minibatch_indices = indices[i : i + minibatch_size]
             rollout_minibatch = rollout_flat[minibatch_indices]
 
-            # print(
-            #     (
-            #         (rollout_minibatch.states[:, 0] - rollout_minibatch.logprobs) > 0
-            #     ).any(),
-            #     (
-            #         (rollout_minibatch.actions[:, 0] - rollout_minibatch.logprobs) > 0
-            #     ).any(),
-            # )
-
             values_minibatch = model.value(rollout_minibatch.states)
             means, logstds = model.actor(rollout_minibatch.states)
 
@@ -360,17 +325,6 @@ def ppo_update(
             with torch.no_grad():
                 approx_kl = ((ratio - 1) - log_ratio).mean()
 
-                # if iter_num == 0 and i == 0:
-                #     idx = (ratio - 1).abs().argmax()
-                #     print(
-                #         # "logprob=",dist.log_prob(rollout_minibatch.actions).sum(-1)[idx],
-                #         # "logprob=",rollout_minibatch.logprobs[idx],
-                #         f"{means[idx]=} {logstds[idx]=} {rollout_minibatch.actions[idx]=}",
-                #     )
-                #     print(
-                #         f"{approx_kl=} {(ratio-1).abs().max()=} {log_ratio.abs().max()=}"
-                #     )
-
                 if target_kl is not None and approx_kl > target_kl:
                     break
 
@@ -388,15 +342,15 @@ def ppo_update(
 
             check_na(vf_loss, "vf_loss")
 
-            means_excess = means - torch.clamp(means, -1, 1)
-            logstds_excess = logstds - torch.clamp(logstds, -2, 2)
-            excess_penalty = (means_excess**2 + logstds_excess**2).mean()
+            # means_excess = means - torch.clamp(means, -1, 1)
+            # logstds_excess = logstds - torch.clamp(logstds, -2, 2)
+            # excess_penalty = (means_excess**2 + logstds_excess**2).mean()
 
             loss = (
                 policy_loss
                 + vf_coef * vf_loss
                 + -entropy_coef * entropy
-                + excess_penalty
+                # + excess_penalty
             )
 
             check_na(loss, "loss")
@@ -421,18 +375,6 @@ def ppo_update(
             approx_kl = ((ratio - 1) - log_ratio).mean()  # type: ignore
             if target_kl is not None and approx_kl > target_kl:
                 break
-
-    # var_y = np.var(rollout.returns.cpu().numpy())
-    # if var_y != 0:
-    #     explained_variance = (
-    #         1
-    #         - np.var(
-    #             rollout_flat.returns.cpu().numpy()
-    #             - rollout_flat.value_estimates.detach().cpu().numpy()
-    #         )
-    #         / var_y
-    #     )
-    #     print(f"Explained variance: {explained_variance:.2f}")
 
     return losses
 
@@ -462,9 +404,6 @@ def run_rollout(
 
     for _ in range(steps):
         (actions_, logprobs_) = model.sample_action(obs, deterministic)
-        # obs[:, 0] = torch.arange(len(obs))
-        # logprobs_[:] = torch.arange(len(obs))
-        # actions_[:, 0] = torch.arange(len(obs))
 
         values = model.value_target(obs)
 
@@ -565,7 +504,7 @@ def run_training():
     state_dim: int = env.single_observation_space.shape[0]  # type: ignore
     action_dim: int = env.single_action_space.shape[0]  # type: ignore
     model = ActorCritic(state_dim, action_dim).to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=3e-4, eps=1e-5, weight_decay=1e-5)  # type: ignore
+    optimizer = torch.optim.Adam(model.parameters(), lr=3e-4, eps=1e-5)  # type: ignore
 
     out_dir = 0
     while os.path.exists("runs/" + str(out_dir)):
@@ -624,7 +563,7 @@ def run_training():
                     )
 
             # Run a pass over the data.
-            # model.synchronize_critics(VF_SYNCHRONIZE_BETA)
+            model.synchronize_critics(VF_SYNCHRONIZE_BETA)
             # model.train()
             losses = ppo_update(
                 optimizer,
@@ -664,10 +603,10 @@ def eval():
     random.seed(0)
 
     ENV = "PickCube-v1"
-    NUM_ENVS = 100
-    DO_RECORDING = False
-    # NUM_ENVS = 1
-    # DO_RECORDING = True
+    # NUM_ENVS = 100
+    # DO_RECORDING = False
+    NUM_ENVS = 1
+    DO_RECORDING = True
 
     assert not DO_RECORDING or NUM_ENVS == 1, "NUM_ENVS must be 1 if recording."
 
@@ -688,7 +627,7 @@ def eval():
         )
     env = ManiSkillVectorEnv(
         env,  # type: ignore
-        auto_reset=False,
+        auto_reset=True,
         ignore_terminations=True,
         record_metrics=True,
     )
@@ -696,29 +635,33 @@ def eval():
         env.single_observation_space.shape[0],  # type: ignore
         env.single_action_space.shape[0],  # type: ignore
     ).to(device)
-    model.load_state_dict(torch.load("runs/144/ckpt_200.pt", weights_only=True))
+    model.load_state_dict(torch.load("runs/152/ckpt_200.pt", weights_only=True))
 
-    rollout = run_rollout(
-        env,
-        model,
-        steps=50,
-        deterministic=True,
-        gamma=0,
-        lambda_=0,
-        normalize_advantages=False,
-        finite_horizon_gae=False,
-    )
-    stats = {}
-    for done_mask, info in zip(rollout.dones, rollout.infos):
-        if done_mask.any():
-            for k, v in info["episode"].items():
-                if k not in stats:
-                    stats[k] = []
+    while True:
+        rollout = run_rollout(
+            env,
+            model,
+            steps=50,
+            deterministic=True,
+            gamma=0,
+            lambda_=0,
+            normalize_advantages=False,
+            finite_horizon_gae=False,
+        )
+        stats = {}
+        for done_mask, info in zip(rollout.dones, rollout.infos):
+            if done_mask.any():
+                for k, v in info["final_info"]["episode"].items():
+                    if k not in stats:
+                        stats[k] = []
 
-                stats[k].extend(v[done_mask].detach().cpu().tolist())
+                    stats[k].extend(v[done_mask].detach().cpu().tolist())
 
-    for k in stats.keys():
-        print(f"{k}: {sum(stats[k]) / len(stats[k]):.3f} ({NUM_ENVS} trials)")
+        for k in stats.keys():
+            print(f"{k}: {sum(stats[k]) / len(stats[k]):.2f} ({NUM_ENVS} trials)")
+
+        if sum(stats["success_once"]) > 0:
+            break
 
 
 if __name__ == "__main__":
