@@ -3,6 +3,7 @@ import os
 import random
 import sys
 from dataclasses import dataclass
+import time
 from typing import Optional
 
 import gymnasium as gym
@@ -199,26 +200,47 @@ class ActorCritic(nn.Module):
     def __init__(self, state_dim: int, action_dim: int):
         super().__init__()
 
-        self.actor_base = make_base([state_dim, 256, 256, 256])
-        self.mean_head = nn.Linear(256, action_dim)
-        layer_init(self.mean_head, std=0.01 * np.sqrt(2))
+        # self.actor_base = make_base([state_dim, 256, 256, 256])
+        # self.mean_head = nn.Linear(256, action_dim)
+        # layer_init(self.mean_head, std=0.01 * np.sqrt(2))
+
+        self.critic = nn.Sequential(
+            layer_init(nn.Linear(state_dim, 256)),
+            nn.Tanh(),
+            layer_init(nn.Linear(256, 256)),
+            nn.Tanh(),
+            layer_init(nn.Linear(256, 256)),
+            nn.Tanh(),
+            layer_init(nn.Linear(256, 1)),
+        )
+        self.actor_mean = nn.Sequential(
+            layer_init(nn.Linear(state_dim, 256)),
+            nn.Tanh(),
+            layer_init(nn.Linear(256, 256)),
+            nn.Tanh(),
+            layer_init(nn.Linear(256, 256)),
+            nn.Tanh(),
+            layer_init(nn.Linear(256, action_dim), std=0.01 * np.sqrt(2)),
+        )
+
         self.logstd = nn.Parameter(-0.5 * torch.ones(1, action_dim), requires_grad=True)
         self.critic = make_critic(state_dim)
-        self.critic_target = make_critic(state_dim)
-        self.critic_target.load_state_dict(self.critic.state_dict())
-        self.critic_target.requires_grad_(False)
+        # self.critic_target = make_critic(state_dim)
+        # self.critic_target.load_state_dict(self.critic.state_dict())
+        # self.critic_target.requires_grad_(False)
 
-    def synchronize_critics(self, beta: float):
-        # Exponential moving average
-        with torch.no_grad():
-            for param, target_param in zip(
-                self.critic.parameters(), self.critic_target.parameters()
-            ):
-                target_param.data = beta * target_param.data + (1 - beta) * param.data
+    # def synchronize_critics(self, beta: float):
+    #     # Exponential moving average
+    #     with torch.no_grad():
+    #         for param, target_param in zip(
+    #             self.critic.parameters(), self.critic_target.parameters()
+    #         ):
+    #             target_param.data = beta * target_param.data + (1 - beta) * param.data
 
     def actor(self, states: torch.Tensor):
-        x_actor = self.actor_base(states)
-        mean = F.tanh(self.mean_head(x_actor))
+        # x_actor = self.actor_base(states)
+        # mean = F.tanh(self.mean_head(x_actor))
+        mean = self.actor_mean(states)
         logstd = self.logstd.expand_as(mean)
         return mean, logstd
 
@@ -309,6 +331,20 @@ def ppo_update(
             losses["vf_loss"].append(vf_loss.item())
             losses["entropy"].append(entropy.item())
             losses["approx_kl"].append(approx_kl)
+
+        # See if we need to stop early because KL divergence is too high.
+        with torch.no_grad():
+            approx_kl = ((ratio - 1) - log_ratio).mean().item()  # type: ignore
+            if target_kl is not None and approx_kl > target_kl:
+                break
+
+    var_y = np.var(rollout.returns.cpu().numpy())
+    if var_y != 0:
+        explained_variance = (
+            1
+            - np.var(rollout_flat.returns.cpu().numpy() - values.cpu().numpy()) / var_y
+        )
+        print(f"Explained variance: {explained_variance:.2f}")
 
     return losses
 
@@ -422,7 +458,7 @@ def run_training():
     state_dim: int = env.single_observation_space.shape[0]  # type: ignore
     action_dim: int = env.single_action_space.shape[0]  # type: ignore
     model = ActorCritic(state_dim, action_dim).to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=3e-4, eps=1e-6)  # type: ignore
+    optimizer = torch.optim.Adam(model.parameters(), lr=3e-4, eps=1e-5)  # type: ignore
 
     out_dir = 0
     while os.path.exists("runs/" + str(out_dir)):
@@ -457,6 +493,8 @@ def run_training():
 
     with tqdm.tqdm(total=EPOCHS) as pbar:
         for epoch in range(EPOCHS):
+            # model.eval()
+            # rollout_start = time.time()
             rollout = run_rollout(
                 env,
                 model,
@@ -467,6 +505,12 @@ def run_training():
                 normalize_advantages=NORMALIZE_ADVANTAGES,
                 finite_horizon_gae=FINITE_HORIZON_GAE,
             )
+            # rollout_end = time.time()
+            # print(
+            #     "Steps per second: {:.2f}".format(
+            #         (EPISODE_STEPS * NUM_ENVS) / (rollout_end - rollout_start)
+            #     ),
+            # )
             train_returns = rollout.returns.sum(0).mean().item()
             train_rewards = rollout.rewards.sum(0).mean().item()
             for done_mask, info in zip(rollout.dones, rollout.infos):
@@ -482,6 +526,7 @@ def run_training():
 
             # Run a pass over the data.
             # model.synchronize_critics(VF_SYNCHRONIZE_BETA)
+            # model.train()
             losses = ppo_update(
                 optimizer,
                 model,
