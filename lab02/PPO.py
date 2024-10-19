@@ -248,7 +248,10 @@ class ActorCritic(nn.Module):
             actions = dist.sample()
 
         # Clamp to action space.
-        actions = torch.clamp(actions, -1, 1)
+        # ^^^ This actually should be done before being sent to the environment,
+        # but the original action should be preserved. Otherwise, log probabilities
+        # get too unstable.
+        # actions = torch.clamp(actions, -1, 1)
 
         # Sum across all action dimensions.
         # Shape is [batch_size, num_action-dimensions]
@@ -302,11 +305,21 @@ def ppo_update(
         assert not torch.any(torch.isnan(value)), f"NaN in {label}"
 
     for iter_num in range(num_iterations):
-        indices = torch.randperm(len(rollout_flat), device=device)
+        # indices = torch.randperm(len(rollout_flat), device=device)
+        indices = torch.arange(len(rollout_flat), device=device)
 
         for i in range(0, len(indices), minibatch_size):
             minibatch_indices = indices[i : i + minibatch_size]
             rollout_minibatch = rollout_flat[minibatch_indices]
+
+            # print(
+            #     (
+            #         (rollout_minibatch.states[:, 0] - rollout_minibatch.logprobs) > 0
+            #     ).any(),
+            #     (
+            #         (rollout_minibatch.actions[:, 0] - rollout_minibatch.logprobs) > 0
+            #     ).any(),
+            # )
 
             values_minibatch = model.value(rollout_minibatch.states)
             means, logstds = model.actor(rollout_minibatch.states)
@@ -336,8 +349,16 @@ def ppo_update(
             with torch.no_grad():
                 approx_kl = ((ratio - 1) - log_ratio).mean()
 
-                if iter_num == 0 and i == 0:
-                    print(f"{approx_kl=} {(ratio-1).abs().max()=} {log_ratio.abs().max()=}")
+                # if iter_num == 0 and i == 0:
+                #     idx = (ratio - 1).abs().argmax()
+                #     print(
+                #         # "logprob=",dist.log_prob(rollout_minibatch.actions).sum(-1)[idx],
+                #         # "logprob=",rollout_minibatch.logprobs[idx],
+                #         f"{means[idx]=} {logstds[idx]=} {rollout_minibatch.actions[idx]=}",
+                #     )
+                #     print(
+                #         f"{approx_kl=} {(ratio-1).abs().max()=} {log_ratio.abs().max()=}"
+                #     )
 
                 if target_kl is not None and approx_kl > target_kl:
                     break
@@ -356,7 +377,16 @@ def ppo_update(
 
             check_na(vf_loss, "vf_loss")
 
-            loss = policy_loss + vf_coef * vf_loss + -entropy_coef * entropy
+            means_excess = means - torch.clamp(means, -1, 1)
+            logstds_excess = logstds - torch.clamp(logstds, -2, 2)
+            excess_penalty = (means_excess**2 + logstds_excess**2).mean()
+
+            loss = (
+                policy_loss
+                + vf_coef * vf_loss
+                + -entropy_coef * entropy
+                + excess_penalty
+            )
 
             check_na(loss, "loss")
 
@@ -418,20 +448,21 @@ def run_rollout(
 
     for _ in range(steps):
         (actions_, logprobs_) = model.sample_action(obs, deterministic)
-        obs[...] = 0.0
+        # obs[:, 0] = torch.arange(len(obs))
+        # logprobs_[:] = torch.arange(len(obs))
+        # actions_[:, 0] = torch.arange(len(obs))
+
         values = model.value_target(obs)
 
         states.append(obs)
         actions.append(actions_)
         logprobs.append(logprobs_)
 
-        means, logstds = model.actor(obs)
-        distribution = Normal(means, torch.exp(logstds))
-        assert distribution.log_prob
-
         value_estimates.append(values)
 
-        obs, reward, terminated, truncated, info = env.step(actions_)
+        # clip action. note though that the original action values must be preserved!
+        actions_clamped = torch.clamp(actions_, -1, 1)
+        obs, reward, terminated, truncated, info = env.step(actions_clamped)
 
         rewards.append(reward)
         dones.append(terminated | truncated)
@@ -481,7 +512,7 @@ def run_training():
     MINIBATCH_SIZE = 800
     GAMMA = 0.8
     LAMBDA = 0.9
-    TARGET_KL = None  # 0.1
+    TARGET_KL = 0.1
     FINITE_HORIZON_GAE = False
 
     torch.manual_seed(SEED)
@@ -511,7 +542,7 @@ def run_training():
     state_dim: int = env.single_observation_space.shape[0]  # type: ignore
     action_dim: int = env.single_action_space.shape[0]  # type: ignore
     model = ActorCritic(state_dim, action_dim).to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=3e-4, eps=1e-5)  # type: ignore
+    optimizer = torch.optim.Adam(model.parameters(), lr=3e-4, eps=1e-5, weight_decay=1e-5)  # type: ignore
 
     out_dir = 0
     while os.path.exists("runs/" + str(out_dir)):
@@ -547,7 +578,7 @@ def run_training():
     with tqdm.tqdm(total=EPOCHS) as pbar:
         for epoch in range(EPOCHS):
             # model.eval()
-            # rollout_start = time.time()
+            rollout_start = time.time()
             rollout = run_rollout(
                 env,
                 model,
@@ -558,14 +589,6 @@ def run_training():
                 normalize_advantages=NORMALIZE_ADVANTAGES,
                 finite_horizon_gae=FINITE_HORIZON_GAE,
             )
-            # rollout_end = time.time()
-            # print(
-            #     "Steps per second: {:.2f}".format(
-            #         (EPISODE_STEPS * NUM_ENVS) / (rollout_end - rollout_start)
-            #     ),
-            # )
-            train_returns = rollout.returns.sum(0).mean().item()
-            train_rewards = rollout.rewards.sum(0).mean().item()
             for done_mask, info in zip(rollout.dones, rollout.infos):
                 global_step += NUM_ENVS
                 if done_mask.any():
@@ -597,8 +620,14 @@ def run_training():
                 {"losses/" + k: losses[k][-1] for k in losses.keys()}, global_step
             )
 
+            rollout_end = time.time()
+            steps_per_second = (EPISODE_STEPS * NUM_ENVS) / (
+                rollout_end - rollout_start
+            )
+
             pbar.set_postfix(
-                {"train/returns": train_returns, "train/rewards": train_rewards}
+                # {"train/returns": train_returns, "train/rewards": train_rewards}
+                {"sps": steps_per_second}
             )
             pbar.update()
 
@@ -644,7 +673,7 @@ def eval():
         env.single_observation_space.shape[0],  # type: ignore
         env.single_action_space.shape[0],  # type: ignore
     ).to(device)
-    model.load_state_dict(torch.load("runs/114/ckpt_500.pt", weights_only=True))
+    model.load_state_dict(torch.load("runs/144/ckpt_200.pt", weights_only=True))
 
     rollout = run_rollout(
         env,
