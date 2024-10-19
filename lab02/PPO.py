@@ -37,6 +37,7 @@ class Rollout:
     )  # dones[t] indicates that after taking action[t], a "done" signal was received.
     infos: list[dict]
     returns: torch.Tensor
+    value_estimates: torch.Tensor
     advantages: torch.Tensor
 
     def flatten(self):
@@ -49,8 +50,9 @@ class Rollout:
             # note: "dones" and "infos" lose their meaning when flattened.
             BLANK_TENSOR,  # self.dones.reshape((-1,)),
             [],  # self.infos,
-            self.returns.reshape((-1,)),
-            self.advantages.reshape((-1,)),
+            self.returns[:-1].reshape((-1,)),
+            self.value_estimates[:-1].reshape((-1,)),
+            self.advantages[:-1].reshape((-1,)),
         )
 
     @staticmethod
@@ -114,6 +116,10 @@ class Rollout:
         if normalize_advantages:
             advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
+        # print(
+        #     f"{states.shape=} {actions.shape=} {rewards.shape=} {logprobs.shape=} {dones.shape=} {value_estimates.shape=} {len(infos)=} {returns.shape=} {advantages.shape=}"
+        # )
+
         return Rollout(
             states,
             actions,
@@ -122,20 +128,8 @@ class Rollout:
             dones,
             infos,
             returns,
+            value_estimates,
             advantages,
-        )
-
-    def sample_batch(self, batch_size: int):
-        indexes = torch.randperm(self.states.shape[0])[:batch_size]
-        return Rollout(
-            self.states[indexes],
-            self.actions[indexes],
-            self.rewards[indexes],
-            self.logprobs[indexes],
-            BLANK_TENSOR,  # self.dones[indexes],
-            [],  # self.infos[indexes],
-            self.returns[indexes],
-            self.advantages[indexes],
         )
 
     def __getitem__(self, slice):
@@ -147,6 +141,7 @@ class Rollout:
             BLANK_TENSOR,  # self.dones[slice],
             [],  # self.infos[slice],
             self.returns[slice],
+            self.value_estimates[slice],
             self.advantages[slice],
         )
 
@@ -276,11 +271,25 @@ def ppo_update(
     vf_coef: float,
     entropy_coef: float,
     grad_clip_norm: float,
-    target_kl: float,
+    target_kl: float | None,
     num_iterations: int,
     minibatch_size: int,
 ) -> dict:
     rollout_flat = rollout.flatten()
+
+    # Check the rollout.
+    for k in [
+        "states",
+        "actions",
+        "rewards",
+        "logprobs",
+        "returns",
+        "value_estimates",
+        "advantages",
+    ]:
+        assert not torch.any(
+            torch.isnan(getattr(rollout_flat, k))
+        ), f"NaN in rollout_flat.{k}"
 
     losses = {
         "policy_loss": [],
@@ -289,15 +298,24 @@ def ppo_update(
         "approx_kl": [],
     }
 
-    for _ in range(num_iterations):
+    def check_na(value, label: str):
+        assert not torch.any(torch.isnan(value)), f"NaN in {label}"
+
+    for iter_num in range(num_iterations):
         indices = torch.randperm(len(rollout_flat), device=device)
 
         for i in range(0, len(indices), minibatch_size):
             minibatch_indices = indices[i : i + minibatch_size]
             rollout_minibatch = rollout_flat[minibatch_indices]
 
-            values = model.value(rollout_minibatch.states)
+            values_minibatch = model.value(rollout_minibatch.states)
             means, logstds = model.actor(rollout_minibatch.states)
+
+            check_na(values_minibatch, "values_minibatch")
+            check_na(means, "means")
+            check_na(logstds, "logstds")
+            check_na(torch.exp(logstds), "stddevs")
+
             dist = Normal(means, torch.exp(logstds))
 
             # Shape: [batch_size, num_action_dimensions]
@@ -305,12 +323,22 @@ def ppo_update(
             logprobs = dist.log_prob(rollout_minibatch.actions).sum(-1)
             entropy = dist.entropy().sum(-1).mean()
 
+            check_na(logprobs, "logprobs")
+            check_na(entropy, "entropy")
+
             log_ratio = logprobs - rollout_minibatch.logprobs
             ratio = torch.exp(log_ratio)
 
+            check_na(log_ratio, "log_ratio")
+            check_na(ratio, "ratio")
+
             # See if we need to stop early because KL divergence is too high.
             with torch.no_grad():
-                approx_kl = ((ratio - 1) - log_ratio).mean().item()
+                approx_kl = ((ratio - 1) - log_ratio).mean()
+
+                if iter_num == 0 and i == 0:
+                    print(f"{approx_kl=} {(ratio-1).abs().max()=} {log_ratio.abs().max()=}")
+
                 if target_kl is not None and approx_kl > target_kl:
                     break
 
@@ -319,32 +347,51 @@ def ppo_update(
                 rollout_minibatch.advantages
                 * torch.clamp(ratio, 1 - clip_coefficient, 1 + clip_coefficient),
             ).mean()
-            vf_loss = F.mse_loss(values, rollout_minibatch.returns, reduction="mean")
+
+            check_na(policy_loss, "policy_loss")
+
+            vf_loss = F.mse_loss(
+                values_minibatch, rollout_minibatch.returns, reduction="mean"
+            )
+
+            check_na(vf_loss, "vf_loss")
+
             loss = policy_loss + vf_coef * vf_loss + -entropy_coef * entropy
+
+            check_na(loss, "loss")
 
             optimizer.zero_grad()
             loss.backward()
+
+            for param_name, param_value in model.named_parameters():
+                if torch.any(torch.isnan(param_value)):
+                    print(f"NaN in model.parameters::{param_name}")
+
             torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
             optimizer.step()
 
             losses["policy_loss"].append(policy_loss.item())
             losses["vf_loss"].append(vf_loss.item())
             losses["entropy"].append(entropy.item())
-            losses["approx_kl"].append(approx_kl)
+            losses["approx_kl"].append(approx_kl.item())
 
         # See if we need to stop early because KL divergence is too high.
         with torch.no_grad():
-            approx_kl = ((ratio - 1) - log_ratio).mean().item()  # type: ignore
+            approx_kl = ((ratio - 1) - log_ratio).mean()  # type: ignore
             if target_kl is not None and approx_kl > target_kl:
                 break
 
-    var_y = np.var(rollout.returns.cpu().numpy())
-    if var_y != 0:
-        explained_variance = (
-            1
-            - np.var(rollout_flat.returns.cpu().numpy() - values.cpu().numpy()) / var_y
-        )
-        print(f"Explained variance: {explained_variance:.2f}")
+    # var_y = np.var(rollout.returns.cpu().numpy())
+    # if var_y != 0:
+    #     explained_variance = (
+    #         1
+    #         - np.var(
+    #             rollout_flat.returns.cpu().numpy()
+    #             - rollout_flat.value_estimates.detach().cpu().numpy()
+    #         )
+    #         / var_y
+    #     )
+    #     print(f"Explained variance: {explained_variance:.2f}")
 
     return losses
 
@@ -371,11 +418,17 @@ def run_rollout(
 
     for _ in range(steps):
         (actions_, logprobs_) = model.sample_action(obs, deterministic)
+        obs[...] = 0.0
         values = model.value_target(obs)
 
         states.append(obs)
         actions.append(actions_)
         logprobs.append(logprobs_)
+
+        means, logstds = model.actor(obs)
+        distribution = Normal(means, torch.exp(logstds))
+        assert distribution.log_prob
+
         value_estimates.append(values)
 
         obs, reward, terminated, truncated, info = env.step(actions_)
@@ -428,8 +481,8 @@ def run_training():
     MINIBATCH_SIZE = 800
     GAMMA = 0.8
     LAMBDA = 0.9
-    TARGET_KL = 0.1
-    FINITE_HORIZON_GAE = True
+    TARGET_KL = None  # 0.1
+    FINITE_HORIZON_GAE = False
 
     torch.manual_seed(SEED)
     np.random.seed(SEED)
@@ -559,10 +612,10 @@ def eval():
     random.seed(0)
 
     ENV = "PickCube-v1"
-    # NUM_ENVS = 100
-    # DO_RECORDING = False
-    NUM_ENVS = 1
-    DO_RECORDING = True
+    NUM_ENVS = 100
+    DO_RECORDING = False
+    # NUM_ENVS = 1
+    # DO_RECORDING = True
 
     assert not DO_RECORDING or NUM_ENVS == 1, "NUM_ENVS must be 1 if recording."
 
@@ -591,7 +644,7 @@ def eval():
         env.single_observation_space.shape[0],  # type: ignore
         env.single_action_space.shape[0],  # type: ignore
     ).to(device)
-    model.load_state_dict(torch.load("runs/89/ckpt_325.pt", weights_only=True))
+    model.load_state_dict(torch.load("runs/114/ckpt_500.pt", weights_only=True))
 
     rollout = run_rollout(
         env,
