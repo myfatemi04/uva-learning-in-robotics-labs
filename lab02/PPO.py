@@ -1,10 +1,8 @@
-import math
 import os
 import random
 import sys
 from dataclasses import dataclass
 import time
-from typing import Optional
 
 import gymnasium as gym
 import numpy as np
@@ -40,19 +38,24 @@ class Rollout:
     value_estimates: torch.Tensor
     advantages: torch.Tensor
 
+    # next_states: torch.Tensor
+    next_value_estimates: torch.Tensor
+
     def flatten(self):
         return Rollout(
             # Remove the "final" state.
-            self.states[:-1].reshape((-1, self.states.shape[-1])),
+            self.states.reshape((-1, self.states.shape[-1])),
             self.actions.reshape((-1, self.actions.shape[-1])),
             self.rewards.reshape((-1,)),
             self.logprobs.reshape((-1,)),
             # note: "dones" and "infos" lose their meaning when flattened.
             BLANK_TENSOR,  # self.dones.reshape((-1,)),
             [],  # self.infos,
-            self.returns[:-1].reshape((-1,)),
-            self.value_estimates[:-1].reshape((-1,)),
-            self.advantages[:-1].reshape((-1,)),
+            self.returns.reshape((-1,)),
+            self.value_estimates.reshape((-1,)),
+            self.advantages.reshape((-1,)),
+            # self.next_states.reshape((-1, self.next_states.shape[-1])),
+            self.next_value_estimates.reshape((-1,)),
         )
 
     @staticmethod
@@ -64,6 +67,8 @@ class Rollout:
         dones: torch.Tensor,
         value_estimates: torch.Tensor,
         infos: list[dict],
+        # next_states: torch.Tensor,
+        next_value_estimates: torch.Tensor,
         gamma: float,
         lambda_: float,
         normalize_advantages: bool,
@@ -75,7 +80,9 @@ class Rollout:
 
         if not finite_horizon_gae:
             for t in reversed(range(seqlen)):
-                delta = rewards[t] + gamma * value_estimates[t + 1] - value_estimates[t]
+                delta = (
+                    rewards[t] + gamma * next_value_estimates[t] - value_estimates[t]
+                )
 
                 # If action t received a "done" signal, then future rewards should not percolate beyond
                 # episode boundaries.
@@ -106,7 +113,7 @@ class Rollout:
                     + lambda_coefficient_sum * rewards[t]
                 )
                 value_term_sum = (
-                    lambda_ * gamma * value_term_sum + gamma * value_estimates[t + 1]
+                    lambda_ * gamma * value_term_sum + gamma * next_value_estimates[t]
                 )
                 advantages[t] = (
                     reward_term_sum + value_term_sum
@@ -130,6 +137,8 @@ class Rollout:
             returns,
             value_estimates,
             advantages,
+            # next_states,
+            next_value_estimates,
         )
 
     def __getitem__(self, slice):
@@ -143,6 +152,8 @@ class Rollout:
             self.returns[slice],
             self.value_estimates[slice],
             self.advantages[slice],
+            # self.next_states[slice],
+            self.next_value_estimates[slice],
         )
 
     def __len__(self):
@@ -438,6 +449,7 @@ def run_rollout(
     finite_horizon_gae: bool,
 ) -> Rollout:
     obs, info = env.reset()
+
     states = []
     actions = []
     logprobs = []
@@ -445,6 +457,8 @@ def run_rollout(
     value_estimates = []
     dones = []
     infos = []
+    next_states = []
+    next_value_estimates = []
 
     for _ in range(steps):
         (actions_, logprobs_) = model.sample_action(obs, deterministic)
@@ -468,10 +482,15 @@ def run_rollout(
         dones.append(terminated | truncated)
         infos.append(info)
 
-    # Add final state.
-    states.append(obs)
-    # Add final value.
-    value_estimates.append(model.value_target(obs))
+        next_states.append(obs)
+        next_value_estimates.append(model.value_target(obs))
+
+        done_mask = dones[-1]
+        if done_mask.any():
+            next_states[-1][done_mask] = info["final_observation"][done_mask]
+            next_value_estimates[-1][done_mask] = model.value_target(
+                info["final_observation"][done_mask]
+            )
 
     states = torch.stack(states).float().detach()
     actions = torch.stack(actions).float().detach()
@@ -479,6 +498,9 @@ def run_rollout(
     logprobs = torch.stack(logprobs).float().detach()
     dones = torch.stack(dones).bool().detach()
     value_estimates = torch.stack(value_estimates).float().detach()
+
+    next_states = torch.stack(next_states).float().detach()
+    next_value_estimates = torch.stack(next_value_estimates).float().detach()
 
     return Rollout.from_raw_states(
         states,
@@ -488,6 +510,8 @@ def run_rollout(
         dones,
         value_estimates,
         infos,
+        # next_states,
+        next_value_estimates,
         gamma,
         lambda_,
         normalize_advantages,
@@ -529,7 +553,6 @@ def run_training():
     )
     env = ManiSkillVectorEnv(
         env,  # type: ignore
-        auto_reset=False,
         ignore_terminations=False,
         record_metrics=True,
     )
